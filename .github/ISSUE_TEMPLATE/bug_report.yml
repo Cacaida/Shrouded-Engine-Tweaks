@@ -1,0 +1,46 @@
+name: Bug report
+description: Something doesn't work, or the game crashes with Shrouded Engine Tweaks installed.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: set.log
+      description: >
+        Drag in `<game folder>\shrouded_engine_tweaks\set.log`. If the game crashed, send `set.prev.log` instead:
+        the restart replaced set.log.
+      placeholder: Drop the file here.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Versions
+      description: The first two lines of set.log, or Settings > Status in the overlay (Runtime and Game Build).
+      placeholder: "Shrouded Engine Tweaks 0.1.0, game build 1793791052"
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: "e.g. NVIDIA RTX 3070, driver 566.36"
+    validations:
+      required: true
+  - type: input
+    id: overlays
+    attributes:
+      label: Other overlays and mods
+      description: Steam, Discord, RTSS/Afterburner, ReShade, other Enshrouded mods, and which SET mods you had loaded.
+  - type: textarea
+    id: status
+    attributes:
+      label: Red or yellow rows in Settings > Status
+      description: Leave empty if everything is green.
