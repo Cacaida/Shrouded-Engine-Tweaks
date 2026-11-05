@@ -1,0 +1,3 @@
+// The runtime's version, made by CMake from project(VERSION) in CMakeLists.txt.
+#pragma once
+#define RUNTIME_VERSION "@PROJECT_VERSION@"

@@ -1,0 +1,23 @@
+# Local work area: the build, game binary copies, extracted data, test notes
+work/
+
+# Game binaries and data never go in the repo
+*.exe
+*.dll
+*.pdb
+*.kfc
+*.kfc_*
+*.dat
+*.dmp
+
+# Extracted or dumped game data
+*.json
+dumps/
+
+# Logs and caches
+*.log
+__pycache__/
+
+# Secrets
+.env
+!.env.example
