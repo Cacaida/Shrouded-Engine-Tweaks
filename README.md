@@ -3,6 +3,7 @@
 [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 ![Version](https://img.shields.io/badge/Version-0.1.0-blue)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue)
+[![Nexus Mods](https://img.shields.io/badge/Nexus%20Mods-Download-orange)](https://www.nexusmods.com/enshrouded/mods/303)
 
 A Lua scripting runtime and mod framework for **Enshrouded**. It loads with the game, adds an in-game overlay with a
 console and tool windows, and gives Lua mods live access to the game's entities, data, systems, options and admin
@@ -44,7 +45,6 @@ commands, all by the names the game itself uses.
 
 **Not done yet:**
 - joined players on your own server: commands go to one player, which may not be you;
-- a release download (build it from source for now);
 - game option changes aren't saved, and the game's menu doesn't show them;
 - no new, cloned or deleted resources;
 - English names only;
@@ -57,9 +57,17 @@ commands, all by the names the game itself uses.
 
 ## Quick start
 
-1. Copy `powrprof.dll` next to `enshrouded.exe`.
-2. Start the game and press the key you want for the overlay.
-3. Put mods in `shrouded_engine_tweaks\mods\<name>\init.lua`.
+1. Download the zip from [Nexus Mods](https://www.nexusmods.com/enshrouded/mods/303) or
+   [Releases](https://github.com/Cacaida/Shrouded-Engine-Tweaks/releases/latest).
+2. Copy `powrprof.dll` and the `shrouded_engine_tweaks` folder next to `enshrouded.exe`, or install it with Vortex.
+3. Start the game and press the key you want for the overlay.
+4. Put mods in `shrouded_engine_tweaks\mods\<name>\init.lua`.
+
+## Reporting problems
+
+Open a [bug report](https://github.com/Cacaida/Shrouded-Engine-Tweaks/issues/new/choose) and attach
+`shrouded_engine_tweaks\set.log` (`set.prev.log` if the game crashed). In the overlay, **Settings**, **Status** shows
+what was found at startup: yellow and red rows are worth including.
 
 ## Guides
 
@@ -97,7 +105,7 @@ commands, all by the names the game itself uses.
 | 18 | Review passes: crash safety inside the Lua lock, honest Status rows |
 | 19 | Observe-only native hooks: bounded argument capture, Lua delivery and diagnostics |
 
-Next: release work.
+Released as 0.1.0. Next: `GetGameBuild()` for mods, so Hooks patterns can be picked per game build.
 
 ## Third-party code
 

@@ -9,10 +9,12 @@
 
 ## Install
 
-1. Copy `powrprof.dll` into the game folder, next to `enshrouded.exe`.
-   On Steam: right-click Enshrouded, **Manage**, **Browse local files**.
-2. Start the game. A small window asks for the key that opens the overlay. Press it (see [First start](#first-start)).
-3. Put mods in `shrouded_engine_tweaks\mods\`, one folder per mod.
+1. Download the zip from [Nexus Mods](https://www.nexusmods.com/enshrouded/mods/303) or
+   [Releases](https://github.com/Cacaida/Shrouded-Engine-Tweaks/releases/latest).
+2. Copy `powrprof.dll` and the `shrouded_engine_tweaks` folder into the game folder, next to `enshrouded.exe`.
+   On Steam: right-click Enshrouded, **Manage**, **Browse local files**. Vortex installs it there too.
+3. Start the game. A small window asks for the key that opens the overlay. Press it (see [First start](#first-start)).
+4. Put mods in `shrouded_engine_tweaks\mods\`, one folder per mod.
 
 That's it. Nothing outside the game folder is changed, and the game's own files stay untouched.
 
