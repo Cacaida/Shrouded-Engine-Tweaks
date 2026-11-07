@@ -18,6 +18,8 @@ extern "C" int hk_test_abi(void* target);
 extern "C" void hk_common();
 extern "C" uint64_t hk_adjacent_a(uint64_t);
 extern "C" uint64_t hk_adjacent_b(uint64_t);
+extern "C" uint64_t hk_foreign_target(uint64_t);
+extern "C" uint64_t hk_foreign_detour(uint64_t);
 
 namespace {
 
@@ -379,6 +381,35 @@ void checkBenchmark() {
     printf("Microbenchmark only: excludes Lua/drains and does not establish game performance.\n");
 }
 
+// Another mod (a plugin's MinHook) hooked the target first: its entry is now a jump to that mod's detour. The pattern
+// still finds the target (scans use the file's bytes), and SET's detour chains in front of the jump.
+void checkForeignHook() {
+    auto t = reinterpret_cast<uint8_t*>(&hk_foreign_target);
+    auto d = reinterpret_cast<uint8_t*>(&hk_foreign_detour);
+    std::string pattern, err;
+    for (int i = 0; i < 8; ++i) {
+        char byte[4];
+        snprintf(byte, sizeof byte, "%02X ", t[i]);
+        pattern += byte;
+    }
+    HCHECK(hk_foreign_target(1) == 0x12345679);
+    DWORD old;
+    HCHECK(VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &old));
+    t[0] = 0xE9;  // jmp rel32
+    int32_t rel = static_cast<int32_t>(d - (t + 5));
+    memcpy(t + 1, &rel, 4);
+    VirtualProtect(t, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), t, 5);
+    HCHECK(hk_foreign_target(1) == 3);
+    auto image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    HCHECK(hk::findPattern(image, pattern, err) == reinterpret_cast<uintptr_t>(t));
+    int id = sub(reinterpret_cast<uintptr_t>(t), "foreign/target", {{hk::U64}});
+    HCHECK(hk_foreign_target(1) == 3);  // the other mod's detour still runs
+    hk::Batch b;
+    HCHECK(hk::drain(id, b) && b.events.size() == 1 && b.events[0].v[0].bits == 1);
+    hk::unsubscribe(id);
+}
+
 void checkAdjacent() {
     auto a = reinterpret_cast<uintptr_t>(&hk_adjacent_a), b = reinterpret_cast<uintptr_t>(&hk_adjacent_b);
     HCHECK(b - a == 8);
@@ -413,6 +444,7 @@ void checkPattern(uintptr_t base) {
 void checkHooks(uintptr_t base) {
     checkAdjacent();
     checkPattern(base);
+    checkForeignHook();
     std::string pattern, err;
     for (int i = 0; i < 24; ++i) {
         char byte[4];

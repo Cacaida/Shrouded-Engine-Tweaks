@@ -148,4 +148,16 @@ hk_adjacent_b PROC
     ret
     db 90h, 90h, 90h
 hk_adjacent_b ENDP
+
+; Another mod's hook on a function SET wants: the test writes a jump from the target to the detour, then SET must
+; still find the target by its original bytes and chain in front of that jump. The odd constant keeps them unique.
+hk_foreign_target PROC
+    lea rax, [rcx + 12345678h]
+    ret
+    db 90h, 90h, 90h, 90h, 90h, 90h, 90h, 90h
+hk_foreign_target ENDP
+hk_foreign_detour PROC
+    lea rax, [rcx + 2]
+    ret
+hk_foreign_detour ENDP
 END

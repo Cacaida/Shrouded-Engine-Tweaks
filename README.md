@@ -1,7 +1,7 @@
 # Shrouded Engine Tweaks
 
 [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
-![Version](https://img.shields.io/badge/Version-0.1.0-blue)
+![Version](https://img.shields.io/badge/Version-0.1.1-blue)
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-blue)
 [![Nexus Mods](https://img.shields.io/badge/Nexus%20Mods-Download-orange)](https://www.nexusmods.com/enshrouded/mods/303)
 
@@ -63,6 +63,9 @@ commands, all by the names the game itself uses.
 3. Start the game and press the key you want for the overlay.
 4. Put mods in `shrouded_engine_tweaks\mods\<name>\init.lua`.
 
+Another mod that also installs a `powrprof.dll` goes into `shrouded_engine_tweaks\plugins\` instead, and loads with
+the game ([how](docs/installation.md#other-dll-mods)).
+
 ## Reporting problems
 
 Open a [bug report](https://github.com/Cacaida/Shrouded-Engine-Tweaks/issues/new/choose) and attach
@@ -104,8 +107,9 @@ what was found at startup: yellow and red rows are worth including.
 | 17 | Systems: all 861 switched off by name, with a profiler |
 | 18 | Review passes: crash safety inside the Lua lock, honest Status rows |
 | 19 | Observe-only native hooks: bounded argument capture, Lua delivery and diagnostics |
+| 20 | 0.1.1: a plugins folder for other DLL mods, hooks that coexist with theirs, `GetGameBuild()` and `mod.json`, and fixes from a stress test (the overlay never stalls the game, require cycles, the overlay key prompt) |
 
-Released as 0.1.0. Next: `GetGameBuild()` for mods, so Hooks patterns can be picked per game build.
+Current release: 0.1.1.
 
 ## Third-party code
 

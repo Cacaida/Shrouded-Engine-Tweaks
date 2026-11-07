@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -23,17 +24,100 @@ struct Range {
     const uint8_t* hi = nullptr;
 };
 
-Range section(uintptr_t base, const char* name) {
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+const IMAGE_NT_HEADERS64* ntOf(uintptr_t base) {
+    return reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+}
+
+const IMAGE_SECTION_HEADER* sectionHeader(uintptr_t base, const char* name) {
+    auto nt = ntOf(base);
     auto s = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, s++) {
-        if (strncmp(reinterpret_cast<const char*>(s->Name), name, IMAGE_SIZEOF_SHORT_NAME) == 0) {
-            auto lo = reinterpret_cast<const uint8_t*>(base + s->VirtualAddress);
-            return {lo, lo + s->Misc.VirtualSize};
-        }
+        if (strncmp(reinterpret_cast<const char*>(s->Name), name, IMAGE_SIZEOF_SHORT_NAME) == 0) return s;
     }
-    return {};
+    return nullptr;
+}
+
+Range section(uintptr_t base, const char* name) {
+    const IMAGE_SECTION_HEADER* s = sectionHeader(base, name);
+    if (!s) return {};
+    auto lo = reinterpret_cast<const uint8_t*>(base + s->VirtualAddress);
+    return {lo, lo + s->Misc.VirtualSize};
+}
+
+// Adds delta to every 64-bit relocation the image's relocation directory lists inside .text (copy holds .text).
+void relocate(uintptr_t base, const IMAGE_SECTION_HEADER* tx, std::vector<uint8_t>& copy, uint64_t delta) {
+    const IMAGE_DATA_DIRECTORY& dir = ntOf(base)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    const uint8_t *p = reinterpret_cast<const uint8_t*>(base + dir.VirtualAddress), *end = p + dir.Size;
+    while (dir.VirtualAddress && p + sizeof(IMAGE_BASE_RELOCATION) <= end) {
+        auto block = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(p);
+        if (block->SizeOfBlock < sizeof *block || p + block->SizeOfBlock > end) break;
+        auto e = reinterpret_cast<const WORD*>(block + 1);
+        for (size_t i = 0, n = (block->SizeOfBlock - sizeof *block) / 2; i < n; i++) {
+            uint64_t rva = block->VirtualAddress + (e[i] & 0xfff), at = rva - tx->VirtualAddress, v;
+            if (e[i] >> 12 != IMAGE_REL_BASED_DIR64 || rva < tx->VirtualAddress || at + 8 > copy.size()) continue;
+            memcpy(&v, copy.data() + at, 8);
+            v += delta;
+            memcpy(copy.data() + at, &v, 8);
+        }
+        p += block->SizeOfBlock;
+    }
+}
+
+// .text as the image's file on disk holds it, with the loader's relocations applied: the code before any detour,
+// SET's or another mod's (a plugin's MinHook on a function SET needs). False if the file isn't this image.
+bool readText(uintptr_t base, std::vector<uint8_t>& out) {
+    const IMAGE_SECTION_HEADER* tx = sectionHeader(base, ".text");
+    wchar_t path[MAX_PATH];
+    if (!tx || !GetModuleFileNameW(reinterpret_cast<HMODULE>(base), path, MAX_PATH)) return false;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    auto readAt = [f](uint64_t off, void* dst, DWORD n) {
+        LARGE_INTEGER at{};
+        at.QuadPart = static_cast<LONGLONG>(off);
+        DWORD got = 0;
+        return SetFilePointerEx(f, at, nullptr, FILE_BEGIN) && ReadFile(f, dst, n, &got, nullptr) && got == n;
+    };
+    std::vector<uint8_t> head(4096);
+    auto nt = ntOf(base);
+    bool ok = readAt(0, head.data(), DWORD(head.size()));
+    LONG lfanew = ok ? reinterpret_cast<const IMAGE_DOS_HEADER*>(head.data())->e_lfanew : 0;
+    ok = ok && lfanew > 0 && size_t(lfanew) + sizeof(IMAGE_NT_HEADERS64) <= head.size();
+    auto fileNt = ok ? reinterpret_cast<const IMAGE_NT_HEADERS64*>(head.data() + lfanew) : nullptr;
+    ok = ok && fileNt->FileHeader.TimeDateStamp == nt->FileHeader.TimeDateStamp &&
+         fileNt->OptionalHeader.SizeOfImage == nt->OptionalHeader.SizeOfImage;
+    if (ok) {
+        out.assign(tx->Misc.VirtualSize, 0);
+        ok = readAt(tx->PointerToRawData, out.data(), std::min<DWORD>(tx->SizeOfRawData, tx->Misc.VirtualSize));
+    }
+    CloseHandle(f);
+    if (!ok) return false;
+    // The loader writes the real base into the mapped header, so the preferred one comes from the file's.
+    uint64_t delta = base - fileNt->OptionalHeader.ImageBase;
+    if (delta) relocate(base, tx, out, delta);
+    return true;
+}
+
+// base's .text for pattern scans, read once per image: the clean file copy, or else the live bytes with SET's own
+// detours undone (hk::restoreCode). A match at data + i is at live + i in the running image.
+struct Code {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    const uint8_t* live = nullptr;
+};
+
+Code cleanText(uintptr_t base) {
+    static std::mutex mx;  // the init thread and Lua's Hooks.observe both scan
+    static std::unordered_map<uintptr_t, std::vector<uint8_t>> copies;
+    Range tx = section(base, ".text");
+    if (!tx.lo) return {};
+    std::lock_guard lock(mx);
+    auto [it, fresh] = copies.try_emplace(base);
+    if (fresh && !readText(base, it->second)) {
+        it->second.assign(tx.lo, tx.hi);
+        hk::restoreCode(reinterpret_cast<uintptr_t>(tx.lo), it->second.data(), it->second.size());
+    }
+    return {it->second.data(), it->second.size(), tx.lo};
 }
 
 const uint8_t* findBytes(Range r, const void* needle, size_t len) {
@@ -270,13 +354,14 @@ uint32_t gameBuild(uintptr_t base) {
 }
 
 uintptr_t findUnique(uintptr_t base, const uint8_t* pat, size_t len) {
-    Range tx = section(base, ".text");
+    Code c = cleanText(base);
+    Range tx{c.data, c.data + c.size};
     const uint8_t* hit = nullptr;
-    for (const uint8_t* a = tx.lo; (a = findBytes({a, tx.hi}, pat, len)) != nullptr; a++) {
+    for (const uint8_t* a = tx.lo; a && (a = findBytes({a, tx.hi}, pat, len)) != nullptr; a++) {
         if (hit) return 0;  // a second match: ambiguous
         hit = a;
     }
-    return reinterpret_cast<uintptr_t>(hit);
+    return hit ? reinterpret_cast<uintptr_t>(c.live + (hit - c.data)) : 0;
 }
 
 namespace {
@@ -313,17 +398,15 @@ uintptr_t hk::findPattern(uintptr_t base, std::string_view pattern, std::string&
         err = "malformed pattern: use 1..256 byte pairs or ??, with at least one exact byte";
         return 0;
     }
-    Range tx = section(base, ".text");
+    Code code = cleanText(base);
     uintptr_t hit = 0;
-    if (tx.lo && bytes.size() <= size_t(tx.hi - tx.lo)) {
-        std::vector<uint8_t> code(tx.lo, tx.hi);
-        hk::restoreCode(reinterpret_cast<uintptr_t>(tx.lo), code.data(), code.size());
-        for (const uint8_t* p = code.data(); p <= code.data() + code.size() - bytes.size(); ++p) {
+    if (code.data && bytes.size() <= code.size) {
+        for (const uint8_t* p = code.data; p <= code.data + code.size - bytes.size(); ++p) {
             size_t i = 0;
             while (i < bytes.size() && (bytes[i] < 0 || bytes[i] == p[i])) ++i;
             if (i != bytes.size()) continue;
             if (hit) { err = "ambiguous pattern: more than one match in .text"; return 0; }
-            hit = reinterpret_cast<uintptr_t>(tx.lo) + (p - code.data());
+            hit = reinterpret_cast<uintptr_t>(code.live) + (p - code.data);
         }
     }
     if (!hit) err = "pattern not found in .text";

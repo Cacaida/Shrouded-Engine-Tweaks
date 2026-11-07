@@ -23,6 +23,7 @@
 #include <map>
 #include <mutex>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -41,6 +42,7 @@ std::atomic<bool> gReload, gLoaded;  // gLoaded: a Lua state with the mods exist
 std::mutex gQueueMx;
 std::vector<std::string> gQueue;
 std::atomic<bool> gOverlayOpen, gHasDraw;
+std::atomic<uint32_t> gBuild;  // the game build (rt::setGameBuild), for GetGameBuild() and mod.json
 
 // Lua runs on the server thread (tick) or the main thread (frame), and on the render thread (Draw). gLuaMx keeps them
 // apart; gInDraw marks the render-thread side, where game memory is off limits because the game mutates it
@@ -1000,7 +1002,8 @@ int luaLoadText(lua_State* L) {
 // survive) and run in its environment, cached per mod. Its chunks are named like "@hello/util.lua" (luaLoadText).
 const char* kTextOnly = R"lua(
     local loadtext = ...
-    local load, loadfile, searchpath, path, error, type = load, loadfile, package.searchpath, package.path, error, type
+    local load, loadfile, searchpath, path, error, type, pcall =
+        load, loadfile, package.searchpath, package.path, error, type, pcall
     _G.load = function(chunk, name, _, ...) return load(chunk, name, "t", ...) end
     package.searchers[2] = function(mod)
         local file, err = searchpath(mod, path)
@@ -1010,10 +1013,13 @@ const char* kTextOnly = R"lua(
         return fn, file
     end
     return function(env, dir, mod)
-        local cache = {}
+        local cache, loading = {}, {}  -- loading: modules whose chunk is running, so a cycle fails instead of recursing
         return function(name)
             if type(name) ~= "string" then error("bad argument #1 to 'require' (string expected)", 2) end
             if cache[name] == nil then
+                if loading[name] then
+                    error("require cycle: '" .. name .. "' is still loading (it requires itself through other modules)", 2)
+                end
                 local path, chunk = dir .. "\\" .. name:gsub("%.", "\\"), "@" .. mod .. "/" .. name:gsub("%.", "/")
                 local fn, err = loadtext(path .. ".lua", chunk .. ".lua", env)
                 if not fn and err:find("^cannot open") then
@@ -1021,7 +1027,10 @@ const char* kTextOnly = R"lua(
                 end
                 if not fn and err:find("^cannot open") then err = "module '" .. name .. "' not found in " .. dir end
                 if not fn then error(err, 2) end
-                local r = fn(name)
+                loading[name] = true
+                local ok, r = pcall(fn, name)
+                loading[name] = nil  -- a module that failed can be required again
+                if not ok then error(r, 0) end
                 if r == nil then r = true end
                 cache[name] = r
             end
@@ -1332,7 +1341,102 @@ void pushModEnv(lua_State* L, const std::string& name) {
     lua_setfield(L, env, "require");
 }
 
-// Runs mods/<name>/init.lua for every mod folder, each in its own environment. A failing mod is reported and skipped.
+std::string modOf(lua_State* L, int idx);
+
+// In the table at idx, every function of mod becomes false (a list, like a dropped callback) or is removed (a map).
+void dropModFns(lua_State* L, int idx, const std::string& mod, bool map) {
+    idx = lua_absindex(L, idx);
+    lua_pushnil(L);
+    while (lua_next(L, idx)) {
+        bool mine = lua_isfunction(L, -1) && modOf(L, -1) == mod;
+        lua_pop(L, 1);
+        if (!mine) continue;
+        lua_pushvalue(L, -1);  // the key, kept for lua_next
+        if (map) lua_pushnil(L);
+        else lua_pushboolean(L, 0);
+        lua_rawset(L, idx);  // assigning to a field that exists is allowed while traversing
+    }
+}
+
+// A mod whose init.lua failed is gone completely: what it registered before the error stops too (callbacks, events,
+// keys, hotkeys, native hooks), so it can't half-run.
+void unloadMod(lua_State* L, const std::string& mod) {
+    for (const char* reg : {kTicks, kDraws, kOnInit, kOnOpen, kOnClose, kOnShutdown, kOnEnter, kOnLeave, kKeys, kBinds}) {
+        lua_getfield(L, LUA_REGISTRYINDEX, reg);
+        dropModFns(L, -1, mod, reg == kKeys || reg == kBinds);
+        lua_pop(L, 1);
+    }
+    lua_getfield(L, LUA_REGISTRYINDEX, kObservers);  // event type hash -> handler list
+    lua_pushnil(L);
+    while (lua_next(L, -2)) {
+        if (lua_istable(L, -1)) dropModFns(L, -1, mod, false);
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    {
+        std::lock_guard lock(gBindMx);
+        std::erase_if(gBinds, [&](const Binding& b) { return b.mod == mod; });
+    }
+    removeModHooks(L, mod);
+}
+
+// mods/<name>/mod.json, optional: {"requires": "0.1.1", "builds": [1793791052]}: the oldest Shrouded Engine Tweaks the
+// mod needs, and the game builds it was made for. Read with the mods' own json.decode.
+struct ModInfo {
+    std::string needs;  // "requires" in mod.json
+    std::vector<uint32_t> builds;
+};
+
+ModInfo readModJson(lua_State* L, const std::string& name) {
+    ModInfo info;
+    FILE* f = nullptr;
+    if (fopen_s(&f, (gModsDir + "\\" + name + "\\mod.json").c_str(), "rb") != 0 || !f) return info;
+    std::string text;
+    char buf[4096];
+    for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+    fclose(f);
+    if (text.starts_with("\xEF\xBB\xBF")) text.erase(0, 3);  // Notepad's UTF-8 BOM
+    int top = lua_gettop(L);
+    lua_getglobal(L, "json");
+    lua_getfield(L, -1, "decode");
+    lua_pushlstring(L, text.data(), text.size());
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK || !lua_istable(L, -1)) {
+        std::string why = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "not a JSON object";
+        gSink((LV_WARN + name + ": mod.json not read (" + why + "), loading without it").c_str());
+        lua_settop(L, top);
+        return info;
+    }
+    if (lua_getfield(L, -1, "requires") == LUA_TSTRING) info.needs = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    if (lua_getfield(L, -1, "builds") == LUA_TTABLE) {
+        for (lua_Integer i = 1; lua_rawgeti(L, -1, i) == LUA_TNUMBER; i++, lua_pop(L, 1))
+            info.builds.push_back(static_cast<uint32_t>(lua_tointeger(L, -1)));
+    }
+    lua_settop(L, top);
+    return info;
+}
+
+// True if version want ("0.2.0") is newer than this Shrouded Engine Tweaks. Missing parts count as 0.
+bool newerThanSet(const std::string& want) {
+    int a[3] = {}, b[3] = {};
+    sscanf_s(want.c_str(), "%d.%d.%d", &a[0], &a[1], &a[2]);
+    sscanf_s(RUNTIME_VERSION, "%d.%d.%d", &b[0], &b[1], &b[2]);
+    return std::lexicographical_compare(b, b + 3, a, a + 3);
+}
+
+// "Mod loaded: x", or failed, with the builds a mod.json named when this game build isn't one of them.
+std::string modLine(const std::string& name, bool ok, const ModInfo& info) {
+    bool other = !info.builds.empty() && std::find(info.builds.begin(), info.builds.end(), gBuild) == info.builds.end();
+    std::string line = (ok ? (other ? LV_WARN "Mod loaded: " : LV_OK "Mod loaded: ") : LV_BAD "Mod failed: ") + name;
+    if (!other) return line;
+    std::string made;
+    for (uint32_t b : info.builds) made += (made.empty() ? "" : ", ") + std::to_string(b);
+    line += " (made for game build" + std::string(info.builds.size() > 1 ? "s " : " ") + made + ", this is " +
+            std::to_string(gBuild) + (ok ? ")" : ": wrong game version?)");
+    return line;
+}
+
+// Runs mods/<name>/init.lua for every mod folder, each in its own environment. A failing mod is reported and unloaded.
 // What init.lua returns is kept for GetMod (true if it returns nothing).
 void loadMods(lua_State* L) {
     int loaded = 0, failed = 0;
@@ -1345,6 +1449,13 @@ void loadMods(lua_State* L) {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || name[0] == '.') continue;
         if (GetFileAttributesA(init.c_str()) == INVALID_FILE_ATTRIBUTES) {
             gSink((LV_WARN "Mod skipped: " + name + " (no init.lua)").c_str());
+            continue;
+        }
+        ModInfo info = readModJson(L, name);
+        if (!info.needs.empty() && newerThanSet(info.needs)) {
+            failed++;
+            gSink((LV_BAD "Mod skipped: " + name + " (needs Shrouded Engine Tweaks " + info.needs +
+                   ", this is " RUNTIME_VERSION ")").c_str());
             continue;
         }
         bool ok = loadText(L, init, ("@" + name + "/init.lua").c_str());
@@ -1361,10 +1472,10 @@ void loadMods(lua_State* L) {
             loaded++;
         } else {
             failed++;
-            removeModHooks(L, name);
+            unloadMod(L, name);
         }
         lua_settop(L, mods);
-        gSink(((ok ? LV_OK "Mod loaded: " : LV_BAD "Mod failed: ") + name).c_str());
+        gSink(modLine(name, ok, info).c_str());
     }
     if (h != INVALID_HANDLE_VALUE) FindClose(h);
     lua_pop(L, 1);
@@ -1399,6 +1510,24 @@ void dropCallback(lua_State* L, lua_Integer i, const char* what) {
     lua_rawseti(L, -2, i);
 }
 
+// A Tick or Draw callback slower than this holds up the game (the server tick or frame, or the mods' Draw).
+constexpr double kSlowMs = 50;
+
+// One yellow line per mod and kind every 10 s, naming the mod whose callback i (in the list on top) was slow.
+void warnSlow(lua_State* L, lua_Integer i, const char* what, double ms) {
+    static std::map<std::string, std::chrono::steady_clock::time_point> told;  // under gLuaMx, like all Lua work
+    lua_rawgeti(L, -1, i);
+    std::string mod = modOf(L, -1);
+    lua_pop(L, 1);
+    auto now = std::chrono::steady_clock::now();
+    auto [it, fresh] = told.try_emplace(mod + "." + what, now);
+    if (!fresh && now - it->second < std::chrono::seconds(10)) return;
+    it->second = now;
+    char line[256];
+    snprintf(line, sizeof line, LV_WARN "%s: a %s callback took %.0f ms (the game waits for it)", mod.c_str(), what, ms);
+    gSink(line);
+}
+
 // Runs every callback in a list: Tick.add, Draw.add or a registerForEvent event (what names it in the error line).
 // A callback that errors is dropped so it can't repeat the error every tick or frame. Tick callbacks get dt, and Draw
 // callbacks get ImGui's stacks restored, so a Begin without End can't break the frame.
@@ -1413,10 +1542,14 @@ void runCallbacks(lua_State* L, const char* reg, const char* what) {
         }
         if (draw) rt::imguiMark();
         if (tick) lua_pushnumber(L, gDt);
+        auto start = std::chrono::steady_clock::now();
         if (!call(L, tick ? 1 : 0, 0)) {
             if (draw) rt::imguiRecover();
             dropCallback(L, i, (std::string(what) + " callback").c_str());
+            continue;
         }
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if ((tick || draw) && ms > kSlowMs) warnSlow(L, i, what, ms);
     }
     lua_pop(L, 1);
 }
@@ -2136,6 +2269,12 @@ int getVersion(lua_State* L) {
     return 1;
 }
 
+// GetGameBuild(): the running exe's build (its link time stamp), as Status shows it, so a mod can pick per build.
+int getGameBuild(lua_State* L) {
+    lua_pushinteger(L, gBuild);
+    return 1;
+}
+
 constexpr std::pair<const char*, int> kNamedKeys[] = {
     {"`", VK_OEM_3},       {"Insert", VK_INSERT}, {"Home", VK_HOME},     {"End", VK_END},
     {"Delete", VK_DELETE}, {"PageUp", VK_PRIOR},  {"PageDown", VK_NEXT}, {"Pause", VK_PAUSE}};
@@ -2192,6 +2331,7 @@ lua_State* rt::open() {
     lua_register(L, "GetMod", getMod);
     lua_register(L, "registerForEvent", registerForEvent);
     lua_register(L, "GetVersion", getVersion);
+    lua_register(L, "GetGameBuild", getGameBuild);
     for (const char* reg : {kTicks, kDraws, kKeys, kObservers, kMods, kBinds, kOnInit, kOnOpen, kOnClose, kOnShutdown,
                             kOnEnter, kOnLeave}) {
         lua_newtable(L);
@@ -2347,7 +2487,16 @@ void rt::queue(std::string line) {
 
 // Draw callbacks, on the render thread inside the overlay's ImGui frame. Waits for the mods' tick or frame.
 void rt::draw() {
-    std::lock_guard lock(gLuaMx);
+    gLuaMx.lock();
+    drawLocked();
+}
+
+// The overlay's way in: takes the Lua lock only if no tick or frame holds it, so a present never waits for a mod.
+bool rt::tryLockDraw() { return gLuaMx.try_lock(); }
+
+// Draw callbacks under the lock tryLockDraw (or draw) took. Releases it.
+void rt::drawLocked() {
+    std::lock_guard lock(gLuaMx, std::adopt_lock);
     if (!gL || gBroken) return;
     gInDraw = true;
     guarded([](uintptr_t) { runCallbacks(gL, kDraws, "draw"); }, 0, "Draw");
@@ -2355,10 +2504,32 @@ void rt::draw() {
     if (gBroken) rt::imguiRecover();  // the callback the access violation stopped may have left windows open
 }
 
+// overlay_selftest only: a helper thread holds the Lua lock, as a long tick would, and Draw counts as registered.
+void rt::testHoldLua(bool on) {
+    static std::thread holder;
+    static std::atomic<bool> hold, held;
+    if (on == holder.joinable()) return;
+    if (!on) {
+        hold = false;
+        holder.join();
+        gHasDraw = false;
+        return;
+    }
+    gHasDraw = hold = true;
+    held = false;
+    holder = std::thread([] {
+        std::lock_guard lock(gLuaMx);
+        held = true;
+        while (hold) Sleep(1);
+    });
+    while (!held) Sleep(1);
+}
+
 bool rt::inDraw() { return gInDraw; }
 bool rt::hasDraw() { return gHasDraw; }
 void rt::setOverlayOpen(bool open) { gOverlayOpen = open; }
 void rt::requestReload() { gReload = true; }
+void rt::setGameBuild(uint32_t build) { gBuild = build; }
 bool rt::modsLoaded() { return gLoaded; }
 bool rt::systemsAvailable() { return gSysOk; }
 void rt::setAdminAvailable(bool ok) { gAdminOk = ok; }

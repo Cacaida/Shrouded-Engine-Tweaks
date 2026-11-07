@@ -23,6 +23,9 @@ void worldLeft();                                    // the player left the worl
 void gameClosing();                                  // the game is closing: onShutdown without the game, then no mods
 void queue(std::string line);                        // console thread or the overlay
 void draw();                                         // render thread, inside the ImGui frame: Draw callbacks
+bool tryLockDraw();                                  // the Lua lock if free (no tick running), for drawLocked
+void drawLocked();                                   // Draw callbacks under tryLockDraw's lock, then releases it
+void testHoldLua(bool on);                           // overlay_selftest only: another thread holds the Lua lock
 bool hasDraw();                                      // any Draw callback registered
 void setOverlayOpen(bool open);                      // Overlay.isOpen(); Keys.on stays silent while open
 void requestReload();                                // reload() at the mods' next tick or frame, from the toolbar
@@ -32,6 +35,7 @@ void setAdminAvailable(bool ok);                     // the admin consumer is ho
 void setSettingsSlot(int index, uint32_t count);     // ecs::GameSettings among the consumer's resources, or -1
 void setGiveAvailable(bool ok);                      // inventory_actions is hooked; Admin.give errors until then
 void setSystemsAvailable(bool ok);                   // the program runner is hooked; Systems.enable errors until then
+void setGameBuild(uint32_t build);                   // the running exe's build, for GetGameBuild() and mod.json
 bool systemsAvailable();                             // the Systems window, any thread
 // System hooks, before the original: writes the armed commands of that system (0 admin_player, 1 inventory_actions).
 void applyAdmin(void* job, int sys = 0);

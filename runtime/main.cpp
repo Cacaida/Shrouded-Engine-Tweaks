@@ -500,6 +500,44 @@ DWORD WINAPI watchLog(void*) {
     }
 }
 
+// Other DLL mods that also install as powrprof.dll (or any name): every .dll in shrouded_engine_tweaks\plugins\, by
+// name, loaded from DllMain where their own DllMain would have run as the game's import. set.log isn't open yet, so
+// each result is kept for init() to log.
+std::vector<std::string> gPlugins;
+
+void loadPlugins() {
+    std::wstring dir = std::wstring(gDir) + L"shrouded_engine_tweaks\\plugins\\";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"*.dll").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) names.push_back(fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(names.begin(), names.end());
+    for (const std::wstring& n : names) {
+        bool ok = LoadLibraryExW((dir + n).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH) != nullptr;
+        DWORD err = GetLastError();
+        char line[MAX_PATH * 2 + 64];
+        std::string name = narrow(n);
+        if (ok) snprintf(line, sizeof line, LV_OK "Plugins: loaded %s", name.c_str());
+        else snprintf(line, sizeof line, LV_BAD "Plugins: %s not loaded (Windows error %lu)", name.c_str(), err);
+        gPlugins.push_back(line);
+    }
+}
+
+void logPlugins() {
+    for (const std::string& l : gPlugins) sink(l.c_str());
+    if (gPlugins.empty()) return;
+    size_t bad = std::count_if(gPlugins.begin(), gPlugins.end(),
+                               [](const std::string& l) { return lv::of(l.c_str()) == lv::bad; });
+    std::string v = std::to_string(gPlugins.size() - bad) + " loaded";
+    if (bad) v += ", " + std::to_string(bad) + " failed: see logs";
+    ov::setStatus("Plugins", v, bad ? lv::warn : lv::ok);
+}
+
 const char* asyncFlag() { return gSet.asyncCompute == 1 ? "--enable-async-compute" : "--disable-async-compute"; }
 
 // The first lines: which version, on which game build, and whether that build was tested.
@@ -509,6 +547,7 @@ void logStart(uintptr_t base) {
     out(LV_OK "Shrouded Engine Tweaks %s (%04u-%02u-%02u)", RUNTIME_VERSION, t.wYear, t.wMonth, t.wDay);
     ov::setStatus("Runtime", RUNTIME_VERSION, lv::ok);
     uint32_t build = gameBuild(base);
+    rt::setGameBuild(build);  // before any mod loads
     bool tested = testedBuild(build);
     out(tested ? LV_OK "Game build: %u" : LV_WARN "Game build: %u", build);  // warn: untested, each feature checks itself
     ov::setStatus("Game Build", std::to_string(build), tested ? lv::ok : lv::warn);
@@ -521,6 +560,7 @@ DWORD WINAPI init(void*) {
     hk::setLog(sink);
     auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     logStart(base);
+    logPlugins();
     if (!s.key) out(LV_WARN "Settings: unknown overlayKey '%s' in settings.ini, using `", s.keyName.c_str());
     if (s.asyncCompute && gFlagged) out(LV_OK "Async compute: %s added to the game's command line", asyncFlag());
     else if (s.asyncCompute) out(LV_WARN "Async compute: the game's command line imports weren't found, %s not added", asyncFlag());
@@ -555,6 +595,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD why, void*) {
         ov::setHistory(gSet.historyLimit, gSet.saveHistory);  // before the overlay attaches and loads the history
         auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         if (gSet.asyncCompute) gFlagged = addLaunchFlag(base, asyncFlag());
+        loadPlugins();
         if (HANDLE t = CreateThread(nullptr, 0, init, nullptr, 0, nullptr)) CloseHandle(t);
     }
     return TRUE;

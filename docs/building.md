@@ -50,6 +50,17 @@ work\build\runtime\Release\overlay_selftest.exe
 - **`overlay_selftest`** opens a small window and drives a real Vulkan swapchain through the overlay layer, closed and
   open, and checks the export forwarding.
 
+To catch memory errors that don't crash (overruns, use after free), build both self-tests with AddressSanitizer in
+a separate folder and run them as above, with the toolset's `bin\Hostx64\x64` folder (it holds
+`clang_rt.asan_dynamic-x86_64.dll`) on `PATH`:
+
+```
+cmake -S runtime -B work/build/asan -G "Visual Studio 18 2026" -A x64 -DSET_ASAN=ON
+cmake --build work/build/asan --config RelWithDebInfo
+```
+
+Any `AddressSanitizer` report is a bug. Never put this build's DLL in the game.
+
 Offline tests alone don't cover the hook layer in the game. After changing it, repeat the in-game check: observe a
 verified game target from a test mod, compare three repeatable frametime runs each for the known-good DLL, the new DLL
 without observers and with observers, and test removal, reload during activity, overflow, world exit/re-entry and

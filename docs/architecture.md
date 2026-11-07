@@ -15,7 +15,9 @@ address-based is found again at every start, and a part that can't be found turn
 | Worker threads | The game's systems, runner profiling and bounded native argument capture; no Lua |
 | Log watcher | Tails `enshrouded.log` for the leave and shutdown lines |
 
-One mutex keeps all Lua apart, so only one thread runs Lua at a time.
+One mutex keeps all Lua apart, so only one thread runs Lua at a time. The render thread only tries it: while a tick
+holds it, the present shows the previous overlay frame instead of waiting. A Tick or Draw callback over 50 ms gets a
+yellow line naming its mod, at most once per 10 s.
 
 ## Loading
 
@@ -24,6 +26,10 @@ One mutex keeps all Lua apart, so only one thread runs Lua at a time.
 - The DLL forwards all 126 of the system `powrprof.dll`'s exports to
   `\\.\GLOBALROOT\SystemRoot\System32\powrprof.dll`, which works wherever Windows is installed (`runtime/exports.h`).
 - In any other process it does nothing.
+- **Plugins:** `DllMain` loads every `.dll` in `shrouded_engine_tweaks\plugins\` in name order, so other mods that
+  ship as `powrprof.dll` still run. Their `DllMain` runs under the loader lock, as it would have as the game's import.
+  The exe only calls SET's forwarded exports, and a plugin that loads `powrprof.dll` by name gets SET, which forwards
+  to System32 too. Results are logged once set.log is open.
 - The exe has no anti-cheat and no packer. A SteamStub wrapper covers only the entry point, so the init thread waits
   for the game window before patching any code.
 - Hooks use MinHook.
@@ -32,6 +38,9 @@ One mutex keeps all Lua apart, so only one thread runs Lua at a time.
 
 - **Byte patterns:** the world tick, the admin consumer, the options update, the camera push and the system runner
   are each found by a prologue pattern that must match exactly once in `.text`.
+- **Clean code:** patterns match `.text` as the exe file holds it, read once (20 MB) with the loader's relocations
+  applied, not the live code. A detour another mod already put on a target (a plugin's MinHook) doesn't hide it, and
+  MinHook chains SET's detour in front of that one. If the file isn't the running build, the live code is scanned.
 - **System names:** the game's system descriptors in `.rdata` are `{char* name, u64 length, fn}`. A system's
   function is found by its name (`inventory_actions`), which survives patches that move code.
 - **The game build** is the exe's link time stamp. Builds that were tested are listed in `game.h`; on any other the
@@ -137,8 +146,9 @@ returns remain the original function's responsibility; observation does not inte
 Registration is serialized. Context, declarations and queue buffers are initialized before the detour is enabled.
 SET reserves its own five detour targets before mods load. Each observation target has one permanent detour, shared
 by subscribers. Removal only deactivates a subscriber; detours, trampolines and contexts remain until process exit.
-Pattern scanning uses a private copy of `.text` with SET's saved original entry bytes overlaid, so retained patches
-do not break reload lookup. The existing exact scanner is unchanged.
+Pattern scanning uses the clean copy of `.text` (see Finding code), so retained patches, SET's or another mod's, do
+not break reload lookup. Only if the file can't be used does it fall back to the live code with SET's saved original
+entry bytes overlaid.
 
 Capture briefly locks metadata to copy active declarations and generations, then decodes their compatible union once
 into bounded stack storage. Pointer and stack reads run under small SEH guards outside queue locks. Capture performs
@@ -174,9 +184,13 @@ A thread tails `enshrouded.log`:
   `VK_LOADER_LAYERS_ENABLE` for this process only, so the loader puts it into the game's Vulkan chain. Nothing is
   installed system-wide.
 - **Drawing:** at each present it records an ImGui frame into the presented image with its own render pass and
-  submits it after the game's work. A frame with nothing to draw passes through untouched.
+  submits it after the game's work. A frame with nothing to draw passes through untouched. Mods' Draw callbacks run
+  first, under the Lua lock, then the built-in windows without it. If the lock is taken, no frame is built and the
+  last one is drawn again.
 - **Input:** a subclass of the game window. While the overlay is open, keyboard and mouse go to ImGui and never reach
   the game's window procedure.
+- **Overlay key:** asked for at a start while `overlayKey` in settings.ini is empty, so a start that ended before a
+  key was picked asks again. A start hint names the key for 5 s, drawing frames while the overlay is closed.
 - **Frame rate cap:** each present waits for its slot.
 - **Async compute:** the exe's `GetCommandLineA/W` imports are pointed at copies with the game's own launch option
   added, before the game's code runs.

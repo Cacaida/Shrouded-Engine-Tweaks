@@ -38,9 +38,9 @@ constexpr char kSettings[] =
     "[runtime]\r\n"
     "; 1 = also open the separate console window. The in-game console is always available.\r\n"
     "console=0\r\n"
-    "; Key that opens the in-game console: ` (default), F1-F24, Insert, Home, End, Delete, PageUp, PageDown, Pause,\r\n"
-    "; or a virtual-key code like 0xC0. Pick a key you don't type.\r\n"
-    "overlayKey=`\r\n"
+    "; Key that opens the in-game console: `, F1-F24, Insert, Home, End, Delete, PageUp, PageDown, Pause,\r\n"
+    "; or a virtual-key code like 0xC0. Pick a key you don't type. Empty: the overlay asks for it at the next start.\r\n"
+    "overlayKey=\r\n"
     "; Frame rate cap: 0 = off, or 10 and up.\r\n"
     "fpsCap=0\r\n"
     "; Async compute: default (the game decides by graphics card), on or off. Applies at the next start.\r\n"
@@ -59,7 +59,8 @@ HWND gWnd;
 WNDPROC gOrig;
 std::atomic<bool> gOpen, gDisabled;
 std::atomic<bool> gAskKey;  // first start: the overlay is open until its key is picked
-bool gFirstRun;             // readSettings created settings.ini
+bool gAskOnStart;           // settings.ini has no overlayKey yet: none was ever picked
+std::atomic<uint64_t> gHintEnd;  // the start hint shows until then (GetTickCount64), while the overlay is closed
 bool gAskRefused;           // a key that can't be the overlay key was pressed
 bool gDropChar;  // the WM_CHAR that follows the toggle key must not be typed
 std::string gIni;
@@ -134,6 +135,7 @@ void toggle() {
         ImGui::GetIO().ClearInputKeys();
         gFocusInput = gCon.scrollDown = true;
         gCapture.clear();  // a capture left when the overlay closed
+        gHintEnd = 0;      // the key is known now
     }
     gOpen = open;
     rt::setOverlayOpen(open);
@@ -467,10 +469,23 @@ void drawAskKey() {
         ImGui::TextUnformatted("Press the key that opens and closes this overlay.");
         ImGui::TextDisabled("`  F1-F24 (not F10)  Insert  Delete  Home  End  PageUp  PageDown  Pause");
         int vk = pressedKey();
+        if (vk && rt::heldMods()) vk = 0;  // with Ctrl, Alt or Shift it's another app's hotkey (Alt+F9)
         if (vk && overlayKeyOk(vk)) setOverlayKey(vk);
         else if (vk) gAskRefused = true;
         if (gAskRefused) ImGui::TextColored(kRed, "That key types text, closes menus or is a system key: pick one above.");
     }
+    ImGui::End();
+}
+
+bool hintDue() { return !gOpen && GetTickCount64() < gHintEnd; }
+
+// Every start, for a few seconds while the overlay is closed: which key opens it. Takes no input.
+void drawHint() {
+    ImGui::SetNextWindowPos(ImVec2(10 * gScale, 10 * gScale));
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+    if (ImGui::Begin("##hint", nullptr, flags)) ImGui::Text("Shrouded Engine Tweaks: %s opens the overlay", gKeyName.c_str());
     ImGui::End();
 }
 
@@ -1409,6 +1424,9 @@ extern "C" __declspec(dllexport) void rtOverlayOpenAll() {
 // overlay_selftest only: shows or ends the first-start key window.
 extern "C" __declspec(dllexport) void rtOverlayAskKey(int on) { gAskKey = on != 0; }
 
+// overlay_selftest only: a long mod tick holds the Lua lock while a mod Draw is registered.
+extern "C" __declspec(dllexport) void rtTestHoldLua(int on) { rt::testHoldLua(on != 0); }
+
 ov::Settings ov::readSettings() {
     Settings s;
     if (gameDir.empty()) return s;
@@ -1418,10 +1436,11 @@ ov::Settings ov::readSettings() {
         DWORD w;
         WriteFile(f, kSettings, sizeof kSettings - 1, &w, nullptr);
         CloseHandle(f);
-        gFirstRun = true;
     }
     wchar_t key[32], async[16], aa[16];
-    GetPrivateProfileStringW(L"runtime", L"overlayKey", L"`", key, 32, path.c_str());
+    GetPrivateProfileStringW(L"runtime", L"overlayKey", L"", key, 32, path.c_str());
+    gAskOnStart = !*key;  // asks until a key is picked, even if an earlier start ended before that
+    if (gAskOnStart) wcscpy_s(key, L"`");
     GetPrivateProfileStringW(L"runtime", L"asyncCompute", L"default", async, 16, path.c_str());
     GetPrivateProfileStringW(L"runtime", L"antiAliasing", L"default", aa, 16, path.c_str());
     s.aaOff = _wcsicmp(aa, L"off") == 0;
@@ -1482,7 +1501,8 @@ void ov::attach(HWND wnd, const std::string& iniPath) {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                        reinterpret_cast<LPCWSTR>(&wndProc), &self);
     gOrig = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(wnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&wndProc)));
-    if (!gFirstRun) {
+    gHintEnd = GetTickCount64() + 5000;
+    if (!gAskOnStart) {
         ov::log(LV_OK "Overlay: attached. %s opens and closes it.", gKeyName.c_str());
         return;
     }
@@ -1497,7 +1517,7 @@ void ov::setToggleKey(int vk, const std::string& name) {
     gToggleKey = vk;
 }
 
-bool ov::visible() { return !gDisabled && (gOpen || rt::hasDraw()); }
+bool ov::visible() { return !gDisabled && (gOpen || hintDue() || rt::hasDraw()); }
 
 void ov::disable() {
     gDisabled = true;
@@ -1506,8 +1526,12 @@ void ov::disable() {
 }
 
 // While closed, mod windows still show but take no input: the mouse is parked off-screen so nothing is hovered.
-// A style load or reset waits for this point, outside any frame.
+// A style load or reset waits for this point, outside any frame. While a mod's tick holds the Lua lock, no frame is
+// built: the caller renders the previous frame's draw data again, so the game's present never waits for Lua. Mods
+// draw first, under that lock, so the built-in windows never run under it.
 void ov::buildFrame() {
+    bool mods = rt::hasDraw() && !gAskKey;  // mods' windows would cover the key window
+    if (mods && !rt::tryLockDraw()) return;
     if (gStyleOp == StyleLoad) gStyleMsg = loadStyle();
     if (gStyleOp == StyleDefault) {
         defaultStyle();
@@ -1517,8 +1541,9 @@ void ov::buildFrame() {
     ImGui_ImplWin32_NewFrame();
     if (!gOpen) ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
     ImGui::NewFrame();
+    if (mods) rt::drawLocked();
     if (gOpen) drawWindows();
-    rt::draw();
+    else if (hintDue()) drawHint();
     ImGui::Render();
 }
 

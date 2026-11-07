@@ -15,7 +15,7 @@ Everything a mod can call. For how mods are put together, see [modding-guide.md]
 | [Keys](#keys) | `Keys.on(key, fn)`, `Keys.hotkey(id, label, fn)`, `Keys.input(id, label, fn(down))` |
 | [UI](#ui-imgui) | `Draw.add(fn)`, `ImGui.*`, `Overlay.isOpen()` |
 | [Admin](#admin-commands) | `Admin.setTime`, `teleport`, `spawn`, `give`, `setLevel`, `setFlameLevel`, `settings()`, `changeSettings{...}`, `send` |
-| [Mods](#mods-and-files) | `GetMod(name)`, `GetVersion()`, `require(name)`, `io.open`, `io.lines`, `json.encode`, `json.decode`, `print` |
+| [Mods](#mods-and-files) | `GetMod(name)`, `GetVersion()`, `GetGameBuild()`, `require(name)`, `io.open`, `io.lines`, `json.encode`, `json.decode`, `print` |
 
 ## Entities (Ecs)
 
@@ -97,7 +97,9 @@ once in the executable's `.text`. Malformed, missing and ambiguous patterns rais
 its own patched entry bytes in a private scan copy, so the same pattern can register again after reload.
 A pattern and its argument declaration belong to one game build. A game update can move, change or duplicate the
 function: the pattern then fails to register, or worse, still matches with a different signature. Verify both again
-after every update. Wildcarding call and jump displacements keeps a pattern working longer, never indefinitely.
+after every update. Wildcarding call and jump displacements keeps a pattern working longer, never indefinitely. Keep
+one pattern per verified build and pick it with `GetGameBuild()`; see
+[Game versions](modding-guide.md#game-versions) for `mod.json`.
 
 Only ordinary Windows x64 calls are supported, with at most eight declared argument positions. Count implicit object
 and hidden aggregate-return pointers as positions too; use `skip` for unwanted positions. Vectorcall, custom register
@@ -384,7 +386,8 @@ Admin.changeSettings({enemyDamageFactor = 0.5, weatherFrequency = 1})   -- only 
 
 ```lua
 GetMod("other")                     -- what mods\other\init.lua returned; true if nothing, nil if not loaded
-print(GetVersion())                 -- "0.1.0"
+print(GetVersion())                 -- "0.1.1"
+print(GetGameBuild())               -- 1793791052: the running game build, as Status shows it
 local util = require("util")        -- util.lua or util\init.lua from your mod's folder, once per mod
 local f = io.open("save.json", "w") -- files inside your mod's folder
 for line in io.lines("notes.txt") do end
@@ -392,6 +395,8 @@ json.encode({a = 1}) json.decode('{"a": 1}')
 print("hello")                      -- to the console and set.log
 ```
 
+- **`require` cycles** (`a` requires `b`, which requires `a`) raise "require cycle: 'a' is still loading" instead of
+  recursing. Move the shared part into a third module.
 - **`json.encode`:** tables with keys 1..n become arrays (`{}` is `[]`), string keys become objects with sorted keys.
   Functions, cycles, NaN and mixed tables raise an error.
 - **`json.decode`:** `null` becomes nil; bad text raises an error giving the position.

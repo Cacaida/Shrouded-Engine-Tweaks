@@ -362,6 +362,7 @@ const char* kLibMod = R"(
     local util = require('util')
     print('where', select(2, pcall(function() local x return x.y end)))
     print('broken', select(2, pcall(require, 'broken')))
+    print('cycle', select(2, pcall(require, 'cyc_a')))
     Tick.add(function() error('tick boom') end)
     local f = assert(io.open('save.txt', 'w'))
     f:write('a\nb\n')
@@ -403,6 +404,47 @@ std::string freshMods() {
     return mods;
 }
 
+// mod.json and failed mods: a mod made for other builds still loads (yellow), or, if it fails while loading, is gone
+// completely (nothing it registered runs); a mod needing a newer SET is skipped without running; a broken mod.json is
+// ignored. GetGameBuild() returns the build as an integer.
+void checkModJson(FakeWorld& w) {
+    std::string mods = freshMods();
+    size_t start = gOut.size();
+    rt::setGameBuild(1792148057);
+    writeFile(mods + "\\oldbuild", "mod.json", "{\"builds\": [1]}");
+    writeFile(mods + "\\oldbuild", "init.lua",
+              "Tick.add(function() print('oldbuild tick') end)\n"
+              "Keys.on('F7', function() end)\n"
+              "Keys.hotkey('heal', 'Heal', function() end)\n"
+              "Observe('EntityDiedEvent', function() print('oldbuild event') end)\n"
+              "Hooks.observe{name = 'gone', pattern = '01 23 45 67 89 AB CD EF 01 23', args = {'u64'}, fn = print}\n");
+    writeFile(mods + "\\newset", "mod.json", "{\"requires\": \"9.0.0\"}");
+    writeFile(mods + "\\newset", "init.lua", "print('newset ran')\n");
+    writeFile(mods + "\\otherbuild", "mod.json", "\xEF\xBB\xBF{\"builds\": [1, 2]}");
+    writeFile(mods + "\\otherbuild", "init.lua", "print('otherbuild up', GetGameBuild(), math.type(GetGameBuild()))\n");
+    writeFile(mods + "\\badjson", "mod.json", "{nope");
+    writeFile(mods + "\\badjson", "init.lua", "print('badjson up')\n");
+    rt::queue("reload()");
+    rt::tick(w.addr());
+    rt::tick(w.addr());
+    rt::afterTick(w.addr());  // EntityDiedEvent handlers would run here
+    std::string out = gOut.substr(start);
+    CHECK(out.find(LV_BAD "Mod failed: oldbuild (made for game build 1, this is 1792148057: wrong game version?)") !=
+          std::string::npos);
+    CHECK(out.find("pattern not found") != std::string::npos);
+    CHECK(out.find("oldbuild tick") == std::string::npos && out.find("oldbuild event") == std::string::npos);
+    int dead = 0;
+    for (const rt::BindInfo& b : rt::bindings(dead)) CHECK(b.mod != "oldbuild");
+    CHECK(out.find(LV_BAD "Mod skipped: newset (needs Shrouded Engine Tweaks 9.0.0, this is " RUNTIME_VERSION ")") !=
+          std::string::npos);
+    CHECK(out.find("newset ran") == std::string::npos);
+    CHECK(out.find("otherbuild up\t1792148057\tinteger") != std::string::npos);
+    CHECK(out.find(LV_WARN "Mod loaded: otherbuild (made for game builds 1, 2, this is 1792148057)") != std::string::npos);
+    CHECK(out.find(LV_WARN "badjson: mod.json not read (") != std::string::npos && out.find("badjson up") != std::string::npos);
+    CHECK(out.find("Mods: 2 loaded, 2 failed") != std::string::npos);
+    printf("mod.json ok\n");
+}
+
 // Mods load on the main thread's first frame, before any world. There is no game there: Ecs finds nothing, and admin
 // commands and events are refused. Console lines run at the next frame.
 void checkMenu() {
@@ -436,6 +478,8 @@ void checkTick(FakeWorld& w) {
     // util.lua starts with a UTF-8 BOM, as Notepad saves it
     writeFile(mods + "\\lib", "util.lua", "\xEF\xBB\xBFreturn {ok = Keys.hotkey ~= nil and io.open ~= nil}\n");
     writeFile(mods + "\\lib", "broken.lua", "return x.y\n");
+    writeFile(mods + "\\lib", "cyc_a.lua", "return require('cyc_b')\n");  // a require cycle fails at once
+    writeFile(mods + "\\lib", "cyc_b.lua", "return require('cyc_a')\n");
     CreateDirectoryA((mods + "\\empty").c_str(), nullptr);
     rt::queue("reload()");
     rt::tick(w.addr());
@@ -457,6 +501,8 @@ void checkTick(FakeWorld& w) {
     CHECK(gOut.find("lib\ttrue\t1\tnil\ttrue") != std::string::npos);
     CHECK(gOut.find("where\tlib/init.lua:") != std::string::npos);
     CHECK(gOut.find("broken\tlib/broken.lua:1: attempt to index a nil value (global 'x')") != std::string::npos);
+    size_t cyc = gOut.find("cycle\t");  // the files tail-call require, so the message has no position
+    CHECK(cyc != std::string::npos && gOut.find("require cycle: 'cyc_a' is still loading", cyc) == cyc + 6);
     CHECK(gOut.find(LV_BAD "lib: tick callback removed after an error\n") != std::string::npos);
     CHECK(gOut.find("getmod\ttrue\t2\tnil\tnil") != std::string::npos && gOut.find("after reload\t2") != std::string::npos);
     printf("tick + mods ok\n");
@@ -608,6 +654,12 @@ void checkDraw(FakeWorld& w) {
     CHECK(first != std::string::npos && gOut.find("draw callback removed", first + 1) == std::string::npos);
     CHECK(gOut.find("draw\ttrue\ttrue\ttrue\tfalse\t") != std::string::npos);
     CHECK(gOut.find("only work inside Draw") != std::string::npos);
+    // A tick callback slower than 50 ms is named once, not on every tick.
+    rt::queue("SLOW = 2 Tick.add(function() if SLOW > 0 then SLOW = SLOW - 1 local t = os.clock() "
+              "while os.clock() - t < 0.06 do end end end)");
+    for (int i = 0; i < 3; i++) rt::tick(w.addr());
+    size_t slow = gOut.find("a tick callback took");
+    CHECK(slow != std::string::npos && gOut.find("a tick callback took", slow + 1) == std::string::npos);
     printf("draw ok\n");
 }
 
@@ -1760,6 +1812,7 @@ int main(int argc, char** argv) {
     checkLuaHooks(w);
     checkHookCallbacks(w, hookPattern);
     checkHookDrawAndWorld(w);
+    checkModJson(w);
     checkClosing(w);
     char self[MAX_PATH];
     CHECK(GetModuleFileNameA(nullptr, self, MAX_PATH));

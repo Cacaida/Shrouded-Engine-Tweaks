@@ -236,28 +236,41 @@ int main(int argc, char** argv) {
     auto frames = reinterpret_cast<uint64_t (*)()>(GetProcAddress(layer, "rtOverlayFrames"));
     auto openAll = reinterpret_cast<void (*)()>(GetProcAddress(layer, "rtOverlayOpenAll"));
     auto askKey = reinterpret_cast<void (*)(int)>(GetProcAddress(layer, "rtOverlayAskKey"));
-    CHECK(frames && openAll && askKey);
+    auto holdLua = reinterpret_cast<void (*)(int)>(GetProcAddress(layer, "rtTestHoldLua"));
+    CHECK(frames && openAll && askKey && holdLua);
     openAll();  // the open frames below draw every built-in window
     makeDevice();
     makeSwapchain();
     printf("layer loaded, swapchain %zu images\n", gImages.size());
     presentFrames(kFrames);
-    CHECK(frames() == 0);  // closed: presents pass through untouched
+    CHECK(frames() == kFrames - 1);  // closed, but the start hint draws for 5 s (not on its first, hidden frame)
+    printf("start hint frames ok\n");
+    Sleep(5100);
+    uint64_t base = frames();
+    presentFrames(kFrames);
+    CHECK(frames() == base);  // closed, hint over: presents pass through untouched
     printf("closed frames ok\n");
     PostMessageW(gWnd, WM_KEYDOWN, VK_OEM_3, 0);  // the toggle key, handled by the layer's window subclass
     presentFrames(kFrames);
-    CHECK(frames() == kFrames);  // open: the overlay drew into every frame
+    CHECK(frames() == base + kFrames);  // open: the overlay drew into every frame
     printf("open frames ok\n");
     askKey(1);  // the first-start key window: the toggle key must not close it
     PostMessageW(gWnd, WM_KEYDOWN, VK_OEM_3, 0);
     presentFrames(10);
     uint64_t asked = frames();
-    CHECK(asked >= kFrames + 9);  // still drawing; ImGui hides a new auto-resizing window for its first frame
+    CHECK(asked >= base + kFrames + 9);  // still drawing; ImGui hides a new auto-resizing window for its first frame
     printf("key window frames ok\n");
     askKey(0);
     PostMessageW(gWnd, WM_KEYDOWN, VK_OEM_3, 0);
     presentFrames(10);
     CHECK(frames() == asked);  // closed again
+    holdLua(1);  // a mod's tick holds the Lua lock: presents go on, with the last overlay frame drawn again
+    presentFrames(10);
+    CHECK(frames() == asked + 10);
+    holdLua(0);
+    presentFrames(10);
+    CHECK(frames() == asked + 10);  // no mod Draw, overlay closed: untouched again
+    printf("lua busy frames ok\n");
     DestroySwapchainKHR(gDev, gSwap, nullptr);
     DestroyDevice(gDev, nullptr);
     DestroySurfaceKHR(gInst, gSurface, nullptr);

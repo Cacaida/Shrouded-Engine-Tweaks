@@ -186,16 +186,49 @@ Mods are treated as third-party code:
 - **Not available:** the rest of `io`, `debug`, `dofile`, `loadfile`, `string.dump`, `os.execute`, `os.remove`,
   `os.rename`, `os.exit`, `os.getenv`, native DLLs.
 
+## Game versions
+
+A game update can move or change what your mod relies on: a native hook pattern, more rarely a component or type.
+Most mods that only use `Ecs`, `Res` and the other data APIs keep working across updates.
+
+**`mod.json`** (optional, next to `init.lua`) tells Shrouded Engine Tweaks what your mod was made for:
+
+```json
+{"requires": "0.1.1", "builds": [1793791052]}
+```
+
+| Field | When it doesn't match |
+|---|---|
+| `requires`, the oldest Shrouded Engine Tweaks your mod needs | The mod isn't loaded, and `init.lua` doesn't run: `Mod skipped: x (needs Shrouded Engine Tweaks 0.1.1, this is 0.1.0)` |
+| `builds`, the game builds you tested (Status shows the running one) | The mod loads anyway. If it works: `Mod loaded: x (made for game build 1793791052, this is ...)`, in yellow. If it fails while loading: `Mod failed: x (made for game build ..., this is ...: wrong game version?)`, with the error that stopped it on the line above |
+
+- **A mod that fails while loading is unloaded completely.** Its Tick, Draw, event handlers, keys and hooks
+  registered before the error stop too, so it never half-runs.
+- **Let what your mod can't work without fail at load.** Call `Hooks.observe` for a hook your mod needs directly at
+  the top of `init.lua`, not inside `pcall`: on a build where its pattern is gone, the mod is reported as not loaded
+  instead of running without it. Use `pcall` only for optional extras.
+- **Several builds:** keep one pattern per build you verified, and pick with `GetGameBuild()`:
+
+```lua
+local DODGE = {[1793791052] = "48 89 5C 24 08 48 89 6C 24 10 ..."}
+local pattern = DODGE[GetGameBuild()] or error("no dodge pattern for game build " .. GetGameBuild())
+Hooks.observe{name = "dodge", pattern = pattern, args = {"skip", "skip", "entity*"}, fn = onDodge}
+```
+
 ## Limits
 
 - **Hosted worlds only** for the game itself (see the table above).
 - **Native hooks observe only:** no inline Lua overrides, return capture or custom register conventions. Patterns
-  belong to one game build: check them again after every game update.
+  belong to one game build: check them again after every game update, and pick them per build with
+  `GetGameBuild()` (see [Game versions](#game-versions)).
 - **Resource edits live in memory:** make them in `onInit`, so they're in place before any world loads. Strings and
   array lengths can't change size; resources can't be created, cloned or deleted.
 - **Game option changes aren't saved,** and the game's settings menu doesn't show them.
 - **Replication:** writes skip the game's dirty-marking. Some fields only reach other players when the server next
   touches them.
+- **Slow callbacks hold up the game:** a Tick callback delays the server tick in a world, or the whole frame at the
+  main menu. A Draw callback can delay the next tick, since only one Lua callback runs at a time. Mod windows also pause
+  while a tick runs, but the game itself keeps drawing. Anything over 50 ms gets a yellow line naming your mod.
 - **Cost:** `Ecs.player()`, `Ecs.each`, `Res.find` and `Res.each` walk a whole map per call. Keep their results, and
   run loops on a key press or a timer, not every tick.
 - **Tick and Draw share one Lua state,** so they wait for each other: keep both short.

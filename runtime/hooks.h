@@ -62,7 +62,8 @@ size_t retainedBytes();
 // A detour SET installs itself (world tick, admin consumer...): observing it is refused with a clear message.
 void reserve(uintptr_t fn, const char* what);
 // The address of the only match of a pattern like "48 89 5C 24 ?? 57" in imageBase's .text, matched against the
-// original bytes (installed detours don't hide a target); 0 with err set if none, several or a bad pattern.
+// original bytes from the image's file (no detour, SET's or another mod's, hides a target); 0 with err set if none,
+// several or a bad pattern.
 uintptr_t findPattern(uintptr_t imageBase, std::string_view pattern, std::string& err);
 void restoreCode(uintptr_t start, uint8_t* copy, size_t size);  // scanner's private copy, never executable memory
 

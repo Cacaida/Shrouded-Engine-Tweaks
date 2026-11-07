@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(shrouded_engine_tweaks VERSION 0.1.0 LANGUAGES C CXX)
+project(shrouded_engine_tweaks VERSION 0.1.1 LANGUAGES C CXX)
 enable_language(ASM_MASM)
 
 # The version, for the code (RUNTIME_VERSION, GetVersion() in Lua) and powrprof.dll's Properties.
@@ -9,6 +9,13 @@ configure_file(version.rc.in version.rc @ONLY)
 # Static CRT: the proxy must not depend on a runtime the game folder lacks.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 set(TP ${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
+
+# AddressSanitizer, for running the self-tests only (docs/building.md). Never ship this DLL.
+option(SET_ASAN "AddressSanitizer build for the self-tests" OFF)
+if(SET_ASAN)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/fsanitize=address> /Zi)  # MASM has no sanitizer
+    add_link_options(/DEBUG /INCREMENTAL:NO)
+endif()
 
 # Lua is compiled as C++ so its errors are C++ exceptions: they unwind our C++ frames properly.
 file(GLOB LUA_SRC CONFIGURE_DEPENDS ${TP}/lua/*.c)
