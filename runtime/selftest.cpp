@@ -16,11 +16,16 @@
 #include <tuple>
 #include <vector>
 
+#include "contracts.h"
 #include "game.h"
 #include "hooks.h"
 #include "level.h"
 #include "lua_api.h"
+#include "report.h"
 #include "version.h"
+#include "inspect.h"
+#include "modsettings.h"
+#include "writelog.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -429,17 +434,17 @@ void checkModJson(FakeWorld& w) {
     rt::tick(w.addr());
     rt::afterTick(w.addr());  // EntityDiedEvent handlers would run here
     std::string out = gOut.substr(start);
-    CHECK(out.find(LV_BAD "Mod failed: oldbuild (made for game build 1, this is 1792148057: wrong game version?)") !=
+    CHECK(out.find(LV_BAD "Mod Failed: oldbuild (made for game build 1, this is 1792148057: Wrong game version?)") !=
           std::string::npos);
     CHECK(out.find("pattern not found") != std::string::npos);
     CHECK(out.find("oldbuild tick") == std::string::npos && out.find("oldbuild event") == std::string::npos);
     int dead = 0;
     for (const rt::BindInfo& b : rt::bindings(dead)) CHECK(b.mod != "oldbuild");
-    CHECK(out.find(LV_BAD "Mod skipped: newset (needs Shrouded Engine Tweaks 9.0.0, this is " RUNTIME_VERSION ")") !=
+    CHECK(out.find(LV_BAD "Mod Skipped: newset (needs Shrouded Engine Tweaks 9.0.0, this is " RUNTIME_VERSION ")") !=
           std::string::npos);
     CHECK(out.find("newset ran") == std::string::npos);
     CHECK(out.find("otherbuild up\t1792148057\tinteger") != std::string::npos);
-    CHECK(out.find(LV_WARN "Mod loaded: otherbuild (made for game builds 1, 2, this is 1792148057)") != std::string::npos);
+    CHECK(out.find(LV_WARN "Mod Loaded: otherbuild (made for game builds 1, 2, this is 1792148057)") != std::string::npos);
     CHECK(out.find(LV_WARN "badjson: mod.json not read (") != std::string::npos && out.find("badjson up") != std::string::npos);
     CHECK(out.find("Mods: 2 loaded, 2 failed") != std::string::npos);
     printf("mod.json ok\n");
@@ -451,7 +456,7 @@ void checkMenu() {
     writeFile(freshMods() + "\\menu", "init.lua", kMenuMod);
     CHECK(!rt::modsLoaded());
     rt::frame();
-    CHECK(rt::modsLoaded() && gOut.find(LV_OK "Mod loaded: menu\n") != std::string::npos);
+    CHECK(rt::modsLoaded() && gOut.find(LV_OK "Mod Loaded: menu\n") != std::string::npos);
     CHECK(gOut.find("menu init\nmenu update\ttrue\n") != std::string::npos);
     rt::queue("local n = 0 for _ in Ecs.each('Health') do n = n + 1 end print('menu ecs', Ecs.player(), n)");
     rt::queue("print('menu admin', pcall(Admin.setTime, 12))");
@@ -491,10 +496,10 @@ void checkTick(FakeWorld& w) {
     rt::tick(w.addr());
     rt::queue("print('after reload', GetMod('lib').version)");
     rt::tick(w.addr());
-    CHECK(gOut.find("server world") != std::string::npos);
-    CHECK(gOut.find("hello mod up\t77") != std::string::npos && gOut.find("Mod loaded: hello") != std::string::npos);
+    CHECK(gOut.find("Server World: ") != std::string::npos);
+    CHECK(gOut.find("hello mod up\t77") != std::string::npos && gOut.find("Mod Loaded: hello") != std::string::npos);
     CHECK(gOut.find("require bin\ttrue") != std::string::npos && gOut.find("attempt to load a binary chunk") != std::string::npos);
-    CHECK(gOut.find(LV_BAD "Mod failed: bin") != std::string::npos && gOut.find(LV_WARN "Mod skipped: empty (no init.lua)") != std::string::npos);
+    CHECK(gOut.find(LV_BAD "Mod Failed: bin") != std::string::npos && gOut.find(LV_WARN "Mod Skipped: empty (no init.lua)") != std::string::npos);
     CHECK(gOut.find("Mods: 2 loaded, 1 failed") != std::string::npos);
     CHECK(gOut.find("badid\tfalse\t") != std::string::npos && gOut.find("use letters, digits and _ only") != std::string::npos);
     CHECK(gOut.find("io\ttrue\t2\t8") != std::string::npos && gOut.find("isolated\tnil\tnil\tnil\tnil") != std::string::npos);
@@ -503,9 +508,29 @@ void checkTick(FakeWorld& w) {
     CHECK(gOut.find("broken\tlib/broken.lua:1: attempt to index a nil value (global 'x')") != std::string::npos);
     size_t cyc = gOut.find("cycle\t");  // the files tail-call require, so the message has no position
     CHECK(cyc != std::string::npos && gOut.find("require cycle: 'cyc_a' is still loading", cyc) == cyc + 6);
-    CHECK(gOut.find(LV_BAD "lib: tick callback removed after an error\n") != std::string::npos);
+    CHECK(gOut.find(LV_BAD "lib: Tick callback removed after an error\n") != std::string::npos);
     CHECK(gOut.find("getmod\ttrue\t2\tnil\tnil") != std::string::npos && gOut.find("after reload\t2") != std::string::npos);
     printf("tick + mods ok\n");
+}
+
+// The read point's check: a system call of the world that spans rt::tick or rt::afterTick counts as an overlap; one
+// that doesn't, or one of another world, doesn't.
+void checkReadPoint(FakeWorld& w) {
+    uint64_t base = rt::overlaps();
+    uint32_t g = rt::jobStart();
+    rt::jobEnd(w.addr(), g);
+    CHECK(rt::overlaps() == base);
+    g = rt::jobStart();
+    rt::tick(w.addr());
+    rt::jobEnd(w.addr() + 8, g);
+    CHECK(rt::overlaps() == base);
+    rt::jobEnd(w.addr(), g);
+    CHECK(rt::overlaps() == base + 1);
+    g = rt::jobStart();
+    rt::afterTick(w.addr());
+    rt::jobEnd(w.addr(), g);
+    CHECK(rt::overlaps() == base + 2);
+    printf("read point ok\n");
 }
 
 // The Bindings window's side: hello registered "heal" (hotkey) and "hold" (input) in checkTick. A combination
@@ -527,15 +552,16 @@ void checkBindings(FakeWorld& w) {
     rt::setBinding("hello.heal", 0, 0xBB);
     rt::setBinding("hello.hold", 0, 0);
     rows = rt::bindings(dead);
-    CHECK(dead == 0 && rows[0].combo == "0xBB" && rows[1].combo.empty());
-    CHECK(gOut.find("Binding hello.heal: Ctrl+F6\n") != std::string::npos && gOut.find("Binding hello.hold: unbound\n") != std::string::npos);
+    CHECK(dead == 0 && rows[0].combo == "Equals" && rows[1].combo.empty());
+    CHECK(rt::keyName(VK_SPACE) == "Space" && rt::keyFromName("space") == VK_SPACE && rt::keyFromName("0x20") == VK_SPACE);
+    CHECK(gOut.find("Binding hello.heal: Ctrl+F6\n") != std::string::npos && gOut.find("Binding hello.hold: Unbound\n") != std::string::npos);
     char v[16];
     GetPrivateProfileStringA("bindings", "gone.x", "none", v, sizeof v, ini.c_str());
     CHECK(strcmp(v, "none") == 0);
     GetPrivateProfileStringA("bindings", "hello.hold", "none", v, sizeof v, ini.c_str());
     CHECK(strcmp(v, "none") == 0);
     GetPrivateProfileStringA("bindings", "hello.heal", "", v, sizeof v, ini.c_str());
-    CHECK(strcmp(v, "0xBB") == 0);
+    CHECK(strcmp(v, "Equals") == 0);
     removeTree(gTmp);
     printf("bindings ok\n");
 }
@@ -589,7 +615,7 @@ void checkLuaEvents(FakeWorld& w) {
     w.streamAt(3)[0x18] = 1;
     rt::afterTick(world);
     CHECK(gOut.find("test\t42") != std::string::npos && gOut.find("events are read-only") != std::string::npos);
-    CHECK(gOut.find("event handler removed") != std::string::npos);
+    CHECK(gOut.find("Event handler removed") != std::string::npos);
     printf("observe + post ok\n");
 }
 
@@ -598,10 +624,34 @@ void checkLuaEvents(FakeWorld& w) {
 void checkKeys() {
     CHECK(rt::keyFromName("`") == VK_OEM_3 && rt::keyFromName("F8") == VK_F8 && rt::keyFromName("f24") == VK_F24);
     CHECK(rt::keyFromName("pageup") == VK_PRIOR && rt::keyFromName("0xC0") == 0xC0 && rt::keyFromName("A") == 'A');
-    for (const char* bad : {"F25", "F1x", "0x", "0x1FF", "AB", "", "Tab"}) CHECK(rt::keyFromName(bad) == 0);
+    for (const char* bad : {"F25", "F1x", "0x", "0x1FF", "AB", "", "Tabs"}) CHECK(rt::keyFromName(bad) == 0);
     CHECK(rt::keyName(VK_OEM_3) == "`" && rt::keyName(VK_F6) == "F6" && rt::keyName(VK_F24) == "F24");
-    CHECK(rt::keyName('Q') == "Q" && rt::keyName('7') == "7" && rt::keyName(VK_PRIOR) == "PageUp" && rt::keyName(0xBB) == "0xBB");
+    CHECK(rt::keyName('Q') == "Q" && rt::keyName('7') == "7" && rt::keyName(VK_PRIOR) == "PageUp");
+    CHECK(rt::keyName(0x07) == "0x07" && rt::keyName(VK_TAB) == "Tab");
     printf("key names ok\n");
+}
+
+// Bug report helpers, on made-up logs and a made-up crash report shaped like the game's enshrouded.info.
+void checkReport() {
+    const std::string ready = "[1] Shrouded Engine Tweaks\n[2] Ready: mods load\n";
+    CHECK(rep::crashed(ready));
+    CHECK(!rep::crashed(ready + "[3] Game closing\n") && !rep::crashed(ready + "[3] Game Closing: Unloading mods\n"));
+    CHECK(!rep::crashed("[1] Shrouded Engine Tweaks\n[2] [E] Reflection: table not found, runtime off\n"));  // can't tell
+    CHECK(!rep::crashed(ready + "[3] [W] Game log: enshrouded.log not readable, onShutdown not on exit\n"));  // 0.1.x
+    CHECK(!rep::crashed(ready + "[3] [W] Game Log: enshrouded.log not readable, onShutdown not on exit\n"));
+    CHECK(!rep::crashed(""));
+    const std::string info = "{\n\t\"exception\": \"\",\n\t\"info\": \"Made up \\\"reason\\\"\",\n\t\"source\": \"Gpu\",\n"
+                             "\t\"callstack\": [\n\t\t{\"addr\": 1050, \"func\": \"\"},\n\t\t{\"addr\": 5000}\n\t],\n"
+                             "\t\"modules\": [\n\t\t{\"addr\": 4000, \"size\": 100, \"file\": \"X:/Sys/powrprof.dll\"},\n"
+                             "\t\t{\"addr\": 1000, \"size\": 100, \"hash\": 0, \"file\": \"X:/Game/POWRPROF.dll\"}\n\t]\n}";
+    CHECK(rep::crashSummary(info, "x:/game/powrprof.dll") ==
+          "Game Crash Report: Made up \"reason\" (source Gpu). Shrouded Engine Tweaks in the crash callstack: Yes (1 of 2 frames).");
+    CHECK(rep::crashSummary(info, "X:/Other/POWRPROF.dll").find("isn't in its module list") != std::string::npos);
+    CHECK(rep::crashSummary("{}", "X:/Game/POWRPROF.dll").rfind("Game Crash Report: No reason given.", 0) == 0);
+    CHECK(rep::redact("at C:\\Users\\Someone\\x and c:/users/someone/y", "C:\\Users\\Someone") ==
+          "at %USERPROFILE%\\x and %USERPROFILE%/y");
+    CHECK(rep::redact("C:\\x", "C:\\") == "C:\\x");
+    printf("report helpers ok\n");
 }
 
 // A window with every kind of widget, a game read that must be refused, and a callback that errors inside Begin.
@@ -650,16 +700,16 @@ void checkDraw(FakeWorld& w) {
     rt::tick(w.addr());
     rt::setOverlayOpen(false);
     ImGui::DestroyContext();
-    size_t first = gOut.find("draw callback removed after an error");
-    CHECK(first != std::string::npos && gOut.find("draw callback removed", first + 1) == std::string::npos);
+    size_t first = gOut.find("Draw callback removed after an error");
+    CHECK(first != std::string::npos && gOut.find("Draw callback removed", first + 1) == std::string::npos);
     CHECK(gOut.find("draw\ttrue\ttrue\ttrue\tfalse\t") != std::string::npos);
     CHECK(gOut.find("only work inside Draw") != std::string::npos);
     // A tick callback slower than 50 ms is named once, not on every tick.
     rt::queue("SLOW = 2 Tick.add(function() if SLOW > 0 then SLOW = SLOW - 1 local t = os.clock() "
               "while os.clock() - t < 0.06 do end end end)");
     for (int i = 0; i < 3; i++) rt::tick(w.addr());
-    size_t slow = gOut.find("a tick callback took");
-    CHECK(slow != std::string::npos && gOut.find("a tick callback took", slow + 1) == std::string::npos);
+    size_t slow = gOut.find("A tick callback took");
+    CHECK(slow != std::string::npos && gOut.find("A tick callback took", slow + 1) == std::string::npos);
     printf("draw ok\n");
 }
 
@@ -695,7 +745,7 @@ void checkAdminFlow(FakeWorld& w) {
     rt::tick(world);
     rt::applyAdmin(nullptr);  // and the game doesn't run it this time
     rt::tick(world);
-    CHECK(u32At(con + 0xb4) == 5 && gOut.find("Admin command adminSetDaytime: not run by the game") != std::string::npos);
+    CHECK(u32At(con + 0xb4) == 5 && gOut.find("Admin Command adminSetDaytime: Not run by the game") != std::string::npos);
     i64At(in + 0x478) = 7;
     printf("admin flow ok\n");
 }
@@ -841,7 +891,7 @@ void checkAdminSettings(FakeWorld& w, FakeJob& j) {
     rt::setSettingsSlot(4, 6);
     run("print('s0', Admin.settings())");  // the settings are taken in the consumer, after this line ran
     run("local s = Admin.settings() print('s1', s.enemyDamageFactor, s.enableStarvingDebuff, s.weatherFrequency, s.dayTimeDuration)");
-    CHECK(gOut.find("s0\tnil") != std::string::npos && gOut.find("Game settings: ready") != std::string::npos);
+    CHECK(gOut.find("s0\tnil") != std::string::npos && gOut.find("Game Settings: Ready") != std::string::npos);
     CHECK(gOut.find("s1\t1.0\tfalse\t2\t1800000000000") != std::string::npos);
     u32At(in + 0x90) = 3;
     run("Admin.changeSettings({enemyDamageFactor = 0.5}) Admin.send('adminChangeGameSettingsAction', {gameSettings = {weatherFrequency = 1}})");
@@ -855,14 +905,14 @@ void checkAdminSettings(FakeWorld& w, FakeJob& j) {
     *j.at("enableDurability") = 7;  // not a bool: the settings are refused, and so is a change
     rt::setSettingsSlot(4, 6);
     run("print('s2', Admin.settings()) Admin.changeSettings({enemyDamageFactor = 2})");
-    CHECK(gOut.find("Game settings: not recognized yet (field enableDurability = 7), still trying") != std::string::npos);
+    CHECK(gOut.find("Game Settings: Not recognized yet (field enableDurability = 7), still trying") != std::string::npos);
     CHECK(gOut.find("s2\tnil") != std::string::npos);
-    CHECK(gOut.find("adminChangeGameSettingsAction: not run, game settings unknown") != std::string::npos);
+    CHECK(gOut.find("adminChangeGameSettingsAction: Not run, game settings unknown") != std::string::npos);
     CHECK(u32At(con + 0xd0) == 3 && f32At(in + 0x58) == 0.5f);
     *j.at("enableDurability") = 1;  // as a load finishing would: the next consumer call takes the settings
     size_t before = gOut.size();
     rt::applyAdmin(j.job);
-    CHECK(gOut.find("Game settings: ready", before) != std::string::npos);
+    CHECK(gOut.find("Game Settings: Ready", before) != std::string::npos);
     rt::setSettingsSlot(5, 6);  // the descriptor's index must match the slot's
     rt::applyAdmin(j.job);
     CHECK(gOut.find("(slot 13 is 4 of 6, expected 5 of 6)") != std::string::npos);
@@ -966,6 +1016,7 @@ void checkLifecycle(FakeWorld& w) {
 // and resources as it exits), then no mods ever again. Last, after checkOptions: the fake options are still attached.
 const char* kByeMod = R"lua(
     local m = GameOptions.machine()
+    Systems.enable("inventory_actions", false)
     registerForEvent("onWorldLeave", function() print("bye leave") end)
     registerForEvent("onShutdown", function()
         print("bye opts", pcall(GameOptions.user))
@@ -983,18 +1034,23 @@ void checkClosing(FakeWorld& w) {
     CreateDirectoryA(mods.c_str(), nullptr);
     writeFile(mods + "\\bye", "init.lua", kByeMod);
     rt::configure(mods, sink);
+    rt::setSystemsAvailable(true);
+    const sys::System& inv = *sys::find("inventory_actions");
     rt::queue("reload()");
     rt::tick(w.addr());
-    CHECK(rt::modsLoaded() && gOut.find("Mod loaded: bye\n") != std::string::npos);
+    CHECK(rt::modsLoaded() && gOut.find("Mod Loaded: bye\n") != std::string::npos);
     gOut.clear();
     rt::gameClosing();
-    CHECK(gOut.find("Left the world\nbye leave\nGame closing: unloading mods\n") != std::string::npos);
+    CHECK(gOut.find("Left the world\nbye leave\nGame Closing: Unloading mods\n") != std::string::npos);
     CHECK(gOut.find("bye opts\tfalse\tthe game is closing") != std::string::npos);
     CHECK(gOut.find("bye res\tfalse\tthe game is closing") != std::string::npos);
     CHECK(gOut.find("bye view\tfalse\t") != std::string::npos && gOut.find("bye io\ttrue\n") != std::string::npos);
     rt::frame();
     rt::tick(w.addr());
     CHECK(!rt::modsLoaded() && gOut.find("Mods: ") == std::string::npos);
+    CHECK(!sys::isOn(inv) && gOut.find("Write Log") == std::string::npos);  // closing undoes nothing
+    sys::setOn(inv, true);
+    rt::setSystemsAvailable(false);
     removeTree(gTmp);
     printf("closing ok\n");
 }
@@ -1002,13 +1058,18 @@ void checkClosing(FakeWorld& w) {
 // An access violation in Lua work (here a world at 0x10: ecs::simTime reads world + 0x4c0) turns the mods off for
 // good, so this runs in a process of its own (main's --av). The lock must be free afterwards: Draw, on another
 // thread, gets it, and nothing runs Lua again.
-int checkAccessViolation() {
+int checkAccessViolation(const char* exe) {
     SetErrorMode(SEM_NOGPFAULTERRORBOX);  // an escaped access violation fails the parent's check, no crash dialog
-    freshMods();
+    HMODULE image = LoadLibraryExA(exe, nullptr, DONT_RESOLVE_DLL_REFERENCES);
+    CHECK(image && sys::scan(reinterpret_cast<uintptr_t>(image)) == 861);
+    rt::setSystemsAvailable(true);
+    const sys::System& inv = *sys::find("inventory_actions");
+    writeFile(freshMods() + "\\off", "init.lua", "Systems.enable('inventory_actions', false)\n");
     rt::frame();
-    CHECK(rt::modsLoaded());
+    CHECK(rt::modsLoaded() && !sys::isOn(inv));
     rt::tick(0x10);
-    CHECK(gOut.find("Lua: access violation, mods off until the game restarts\n") != std::string::npos);
+    CHECK(gOut.find("Lua: Access violation, mods off until the game restarts\n") != std::string::npos);
+    CHECK(sys::isOn(inv) && gOut.find("Write Log: 1 change(s) undone\n") != std::string::npos);  // without Lua
     CHECK(!rt::modsLoaded());
     std::atomic<bool> drawn = false;
     std::thread([&] {
@@ -1225,7 +1286,7 @@ void checkGive(FakeWorld& w) {
     rt::applyAdmin(nullptr, 1);
     CHECK(u32At(in + 0x3c0) == 0x5eed && u32At(con + 0xa0) == u32At(in + 0x3c4) + 1);
     rt::tick(w.addr());
-    CHECK(gOut.find("Admin command adminInventoryCreateAction: not run by the game") != std::string::npos);
+    CHECK(gOut.find("Admin Command adminInventoryCreateAction: Not run by the game") != std::string::npos);
     memset(in + 0x3c0, 0, 20);
     rt::queue("Admin.send('adminRepairAllItemsAction', {})");  // raw, through the same system: version at + 0x598
     rt::tick(w.addr());
@@ -1281,7 +1342,7 @@ void checkReadOnly(lua_State* L, std::vector<uint8_t>& data) {
     CHECK(VirtualProtect(ro, data.size(), PAGE_READONLY, &old));
     CHECK(res::attach(reinterpret_cast<uintptr_t>(ro)));
     rt::exec(L, "local a = Res.get(GA, 'ItemInfo') a.maxStackSize = 31 a.maxStackSize = 32 print('ro', a.maxStackSize)");
-    CHECK(gOut.find("ro\t32\n") != std::string::npos && countOf(gOut, "the game keeps them read-only (protect 0x2)") == 1);
+    CHECK(gOut.find("ro\t32\n") != std::string::npos && countOf(gOut, "The game keeps them read-only (protect 0x2)") == 1);
     CHECK(*reinterpret_cast<uint16_t*>(ro + fieldOff(refl::byName("keen::ItemInfo"), "maxStackSize")) == 32);
     MEMORY_BASIC_INFORMATION mi;
     CHECK(VirtualQuery(ro, &mi, sizeof mi) && mi.Protect == PAGE_READONLY);
@@ -1479,7 +1540,7 @@ void checkOptions(uintptr_t base) {
     app[opts::kAppOptions / 8] = reinterpret_cast<uintptr_t>(o.data());
     auto at = reinterpret_cast<uintptr_t>(app);
     const char* why = opts::frame(at);
-    CHECK(why && std::string(why) == "machine field antiAliasing = 99" && !opts::ready());
+    CHECK(why && std::string(why) == "Machine field antiAliasing = 99" && !opts::ready());
     lua_State* L = rt::open();
     rt::exec(L, "GameOptions.machine()");
     CHECK(gOut.find("game options not found yet") != std::string::npos);
@@ -1619,7 +1680,7 @@ void checkLuaHooks(FakeWorld& w) {
     writeFile(mods + "\\hookmod", "init.lua", script.c_str());
     rt::requestReload();
     rt::tick(w.addr());
-    CHECK(gOut.find("Mod loaded: hookmod") != std::string::npos);
+    CHECK(gOut.find("Mod Loaded: hookmod") != std::string::npos);
     std::vector<uint8_t> hp(refl::lookup("Health").size());
     *reinterpret_cast<int32_t*>(hp.data() + 8) = 37;
     for (int i = 0; i < 5; ++i) CHECK(callLuaHook(17, hp.data()) == 547);
@@ -1638,6 +1699,167 @@ void checkLuaHooks(FakeWorld& w) {
     CHECK(gOut.find("hook event\t37\t0\n") != std::string::npos);
     removeTree(gTmp);
     printf("Lua hooks ok\n");
+}
+
+__declspec(noinline) double luaRuleTarget(uint32_t n, const int32_t* hp, double f) {
+    return n * 1000.0 + (hp ? hp[2] : 0) + f;  // hp[2]: Health.dataStorage[0]
+}
+auto volatile callLuaRule = &luaRuleTarget;
+
+std::string bytePattern(const void* fn) {
+    std::string pattern;
+    for (int i = 0; i < 24; ++i) {
+        char b[4];
+        snprintf(b, sizeof b, "%02X ", static_cast<const uint8_t*>(fn)[i]);
+        pattern += b;
+    }
+    return pattern;
+}
+
+void writeRuleMods(const std::string& mods) {
+    std::string head = "local pat = '" + bytePattern(reinterpret_cast<const void*>(&luaRuleTarget)) +
+                       "' local args = {'u32', 'Health*', 'f64'}\n";
+    std::string a = head + R"lua(
+        local m = {}
+        local function rule(t) t.pattern = pat; t.builds = t.builds or {1792148057}; t.args = args; return Hooks.rule(t) end
+        m.scale = rule{name = 'scale', params = {k = 2}, when = {{arg = 2, field = 'dataStorage[0]', gt = 10}},
+                       set = {{arg = 1, mul = '$k'}, {arg = 3, add = 0.5}}}
+        m.player = rule{name = 'player', when = {{arg = 1, eq = 'player'}}, set = {{arg = 3, set = 100}}}
+        m.listed = rule{name = 'listed', when = {{arg = 1, ['in'] = {50, 51}}}, set = {{arg = 3, add = 1000}}}
+        assert(rule{name = 'elsewhere', builds = {1}, set = {{arg = 1, set = 1}}} == nil)
+        for _, bad in ipairs{
+            {name = 'nobuilds', pattern = pat, args = args, set = {{arg = 1, set = 1}}},
+            {name = 'field', set = {{arg = 2, field = 'dataStorage[0]', set = 1}}},
+            {name = 'noparam', set = {{arg = 1, set = '$nope'}}},
+            {name = 'notlist', when = {arg = 1, eq = 1}, set = {{arg = 1, set = 1}}},
+            {name = 'twoops', set = {{arg = 1, set = 1, add = 2}}},
+            {name = 'pointer', set = {{arg = 2, set = 1}}},
+            {name = 'nochange', when = {{arg = 1, eq = 1}}},
+            {name = 'block', block = 1},
+            {name = 'after', after = {{add = 1}}},
+            {name = 'scale', set = {{arg = 1, set = 1}}},
+        } do
+            local ok, err = pcall(bad.pattern and Hooks.rule or rule, bad)
+            assert(not ok, bad.name); print('rule refused', bad.name, err)
+        end
+        m.setK = function(v) Hooks.param(m.scale, 'k', v) end
+        m.setList = function(ids) Hooks.list(m.listed, ids) end
+        m.remove = function(id) Hooks.remove(id) end
+        m.addValid = function() return rule{name = 'console', set = {{arg = 1, set = 1}}} end
+        assert(not pcall(Hooks.list, m.scale, {1}) and not pcall(Hooks.param, m.scale, 'nope', 1))
+        return m
+    )lua";
+    writeFile(mods + "\\a_rules", "init.lua", a.c_str());
+    std::string b = head + R"lua(
+        Hooks.rule{name = 'later', pattern = pat, builds = {1792148057}, args = args, set = {{arg = 1, add = 1}}}
+        registerForEvent('onInit', function()
+            assert(not pcall(Hooks.param, GetMod('a_rules').scale, 'k', 1)); print('rule ownership blocked')
+        end)
+    )lua";
+    writeFile(mods + "\\b_rules", "init.lua", b.c_str());
+    std::string c = head + R"lua(
+        Hooks.rule{name = 'gone', pattern = pat, builds = {1792148057}, args = args, set = {{arg = 3, add = 5000000}}}
+        error('intentional init failure')
+    )lua";
+    writeFile(mods + "\\c_rules", "init.lua", c.c_str());
+}
+
+void checkLuaRules(FakeWorld& w) {
+    std::string mods = freshMods();
+    rt::setGameBuild(1792148057);
+    writeRuleMods(mods);
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(gOut.find("Mod Loaded: a_rules") != std::string::npos && countOf(gOut, "rule refused\t") == 10);
+    CHECK(gOut.find("Rule 'elsewhere' off: Not verified on game build 1792148057") != std::string::npos);
+    CHECK(gOut.find("b_rules: Rule 'later' changes a value a_rules/scale changes too") != std::string::npos);
+    CHECK(gOut.find("rule ownership blocked") != std::string::npos);
+    int32_t hp[10] = {0, 0, 37};
+    auto call = [&](uint32_t n, int32_t h, double f) { hp[2] = h; return callLuaRule(n, hp, f); };
+    CHECK(call(3, 37, 1) == 7038.5);   // a/scale: n 6, f 1.5; then b/later: n 7; c's rule left with its mod
+    CHECK(call(1, 5, 1) == 2105);      // a/player saw the original n (1, the player); b/later: n 2
+    CHECK(call(50, 5, 0) == 52005);    // a/listed
+    rt::queue("local m = GetMod('a_rules') m.setK(3) m.setList({60})");
+    rt::tick(w.addr());
+    CHECK(call(3, 37, 1) == 10038.5 && call(50, 5, 0) == 51005 && call(60, 5, 0) == 62005);
+    rt::queue("assert(not pcall(GetMod('a_rules').addValid)) print('rule console blocked')");
+    rt::tick(w.addr());
+    CHECK(gOut.find("rule console blocked") != std::string::npos);
+    rt::queue("local m = GetMod('a_rules') m.remove(m.scale)");
+    rt::tick(w.addr());
+    CHECK(call(3, 37, 1) == 4038);
+    size_t bytes = hk::retainedBytes();
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(hk::retainedBytes() == bytes && call(3, 37, 1) == 7038.5);  // the same rules reuse their slots
+    rt::setGameBuild(1);
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(gOut.find("Rule 'scale' off: Not verified on game build 1") != std::string::npos && call(3, 37, 1) == 3038);
+    rt::setGameBuild(0);
+    removeTree(gTmp);
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(call(3, 37, 1) == 3038);
+    printf("Lua rules ok\n");
+}
+
+struct LuaOpt {
+    int32_t level;
+    bool set;
+};
+__declspec(noinline) int64_t luaOptTarget(int32_t level, const LuaOpt* o) { return o->set ? o->level : level; }
+auto volatile callLuaOpt = &luaOptTarget;
+__declspec(noinline) int64_t luaOptCall(int32_t level, int32_t other) {
+    LuaOpt o{other, true};
+    return callLuaOpt(level, &o);
+}
+LuaOpt gLuaOpt{5, true};
+
+// target = "<catalog name>": a synthetic catalog in place of the startup check's.
+void checkLuaCatalogRules(FakeWorld& w) {
+    static const std::vector<contracts::Entry> entries = {
+        {"test_opt", {"i32", "skip"}, "i64", contracts::Args | contracts::Fields | contracts::Block | contracts::After,
+         {{1, "level", 0, "i32", true}, {1, "isSet", 4, "bool", true, true}}, {}, "test"},
+        {"test_off", {"i32", "skip"}, "i64", contracts::Fields, {{1, "level", 0, "i32", true}}, {}, "test"},
+    };
+    contracts::setChecked({{"test_opt", reinterpret_cast<uintptr_t>(&luaOptTarget), "", 1, &entries[0]},
+                           {"test_off", 0, "Untested build", 0, &entries[1]}});
+    std::string mods = freshMods();
+    writeFile(mods + "\\d_catalog", "init.lua", R"lua(
+        assert(Hooks.rule{name = 'enemy', target = 'test_opt', when = {{arg = 2, field = 'isSet', eq = true}},
+                          set = {{arg = 2, field = 'level', add = 10}}})
+        assert(Hooks.rule{name = 'off', target = 'test_off', set = {{arg = 2, field = 'level', set = 1}}} == nil)
+        assert(Hooks.rule{name = 'block', target = 'test_opt', when = {{arg = 1, eq = 99}}, block = -7})
+        assert(Hooks.rule{name = 'bonus', target = 'test_opt', when = {{arg = 1, eq = 77}}, after = {{add = 100}}})
+        for _, bad in ipairs{
+            {name = 'unknown', target = 'nope', set = {{arg = 1, set = 1}}},
+            {name = 'pattern', target = 'test_opt', pattern = '90', set = {{arg = 1, set = 1}}},
+            {name = 'nofield', target = 'test_opt', set = {{arg = 2, field = 'other', set = 1}}},
+            {name = 'nocap', target = 'test_off', set = {{arg = 1, set = 1}}},
+            {name = 'noblock', target = 'test_off', block = 1},
+            {name = 'blockset', target = 'test_opt', block = 1, set = {{arg = 1, set = 1}}},
+            {name = 'noafter', target = 'test_off', after = {{add = 1}}},
+            {name = 'blockafter', target = 'test_opt', block = 1, after = {{add = 1}}},
+            {name = 'readonly', target = 'test_opt', set = {{arg = 2, field = 'isSet', set = false}}},
+        } do
+            local ok, err = pcall(Hooks.rule, bad)
+            assert(not ok, bad.name); print('catalog rule refused', bad.name, err)
+        end
+    )lua");
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(gOut.find("Mod Loaded: d_catalog") != std::string::npos && countOf(gOut, "catalog rule refused\t") == 9);
+    CHECK(gOut.find("Rule 'off' off: Catalog target 'test_off' is off (Untested build)") != std::string::npos);
+    CHECK(luaOptCall(1, 5) == 15 && callLuaOpt(1, &gLuaOpt) == 5 && gLuaOpt.level == 5);
+    CHECK(luaOptCall(99, 5) == -7);  // blocked: the level change before it is dropped too
+    CHECK(luaOptCall(77, 5) == 115);  // the level change, then 100 more on the return
+    removeTree(gTmp);
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(luaOptCall(1, 5) == 5);
+    contracts::setChecked({});
+    printf("Lua catalog rules ok\n");
 }
 
 void checkHookCallbacks(FakeWorld& w, const std::string& pattern) {
@@ -1689,7 +1911,7 @@ void checkHookCallbacks(FakeWorld& w, const std::string& pattern) {
     rt::tick(w.addr());
     CHECK(countOf(gOut, "once hook\n") == 1 && countOf(gOut, "bad hook\n") == 1);
     CHECK(countOf(gOut, "peer hook\n") == 2 && countOf(gOut, "late hook\n") == 0);
-    CHECK(gOut.find("a_hooks: hook 'bad' removed after an error") != std::string::npos);
+    CHECK(gOut.find("a_hooks: Hook 'bad' removed after an error") != std::string::npos);
     rt::tick(w.addr());
     CHECK(countOf(gOut, "peer hook\n") == 3 && countOf(gOut, "late hook\n") == 1);
     CHECK(*reinterpret_cast<int32_t*>(hp.data() + 8) == 37);
@@ -1715,6 +1937,346 @@ void checkHookDrawAndWorld(FakeWorld& w) {
     rt::tick(w.addr());
     removeTree(gTmp);
     printf("hook callbacks and lifecycle ok\n");
+}
+
+// Features(): ids, not labels, are the keys; compatible (this build) apart from available (now: admin needs a world you
+// host); a forced untested build turns game_build and every catalog row off with the check's reason. Leaves the
+// world and enters it again, as checkHookDrawAndWorld does.
+void checkFeatures(FakeWorld& w, uintptr_t base) {
+    uint32_t& tickIndex = *reinterpret_cast<uint32_t*>(w.world + 0x4dc);
+    rt::setFeature("admin", true);
+    rt::setFeature("systems", false, "Not found (game updated?)");
+    rt::setFeature("nope", true);  // not a feature: ignored
+    rt::setGameBuild(1792148057);
+    contracts::setChecked(contracts::check(base, 1792148057, contracts::catalog()));
+    tickIndex = 5;
+    rt::queue("local f = Features() print('feat in', f.admin.compatible, f.admin.available, f.admin.reason, "
+              "f.hit.compatible, f.hit.available, f.game_build.compatible, f.game_build.label, f.systems.compatible, "
+              "f.systems.reason, f.overlay.reason, f.nope, f[f.admin.label])");
+    rt::tick(w.addr());
+    CHECK(gOut.find("feat in\ttrue\ttrue\t\ttrue\ttrue\ttrue\tGame Build 1792148057\tfalse\tNot found (game updated?)\t"
+                    "Not checked yet\tnil\tnil\n") != std::string::npos);
+    rt::worldLeft();
+    rt::queue("local f = Features() print('feat out', f.admin.compatible, f.admin.available, f.admin.reason, "
+              "f.systems.available)");
+    rt::frame();
+    CHECK(gOut.find("feat out\ttrue\tfalse\tNot in a world you host\tfalse\n") != std::string::npos);
+    rt::setGameBuild(1);
+    contracts::setChecked(contracts::check(base, 1, contracts::catalog()));
+    rt::queue("local f = Features() print('feat untested', f.game_build.compatible, f.game_build.label, "
+              "f.hit.compatible, f.hit.reason, f.combat_xp.available, f.combat_xp.label)");
+    rt::frame();
+    CHECK(gOut.find("feat untested\tfalse\tGame Build 1\tfalse\tUntested build\tfalse\tRule Target combat_xp\n") !=
+          std::string::npos);
+    auto all = rt::features();
+    for (const rt::Feature& f : all)
+        CHECK(std::count_if(all.begin(), all.end(), [&](const rt::Feature& g) { return g.id == f.id; }) == 1 &&
+              !f.label.empty() && f.label != f.id);
+    CHECK(all.size() == 11 + contracts::catalog().size() && all[0].id == "game_build");
+    rt::setGameBuild(0);
+    contracts::setChecked({});
+    Sleep(2100);
+    tickIndex = 1;  // the next world
+    rt::tick(w.addr());
+    CHECK(countOf(gOut, "Entered a world\n") >= 2);
+    printf("features ok\n");
+}
+
+// The write log on its own, on game options memory: in both unload orders the value ends at the original, never at the
+// first mod's; a value changed outside the log is left alone; overlapping writes share one record; a full log refuses
+// new records only, and the old ones still restore.
+void checkWriteLogCore() {
+    uint8_t* m = opts::machine();
+    auto v = reinterpret_cast<uint32_t*>(m + 0x100);
+    uint32_t keep[2] = {v[0], v[1]};
+    auto w = [&](const char* mod, uint32_t x) {
+        CHECK(wlog::reserve(wlog::Opt, m, reinterpret_cast<uint8_t*>(v), 4, mod));
+        *v = x;
+        wlog::wrote(reinterpret_cast<uint8_t*>(v), &x, 4);
+    };
+    for (bool aFirst : {true, false}) {
+        *v = 100;
+        w("A", 150);
+        w("B", 200);
+        wlog::leave(aFirst ? "A" : "B", sink);
+        CHECK(*v == 200 && wlog::records() == 1);
+        wlog::leave(aFirst ? "B" : "A", sink);
+        CHECK(*v == 100 && wlog::records() == 0);
+    }
+    CHECK(gOut.find("Write Log: GameOptions.machine() at +0x100 stays changed: B changed it too\n") != std::string::npos);
+    CHECK(gOut.find("Write Log: GameOptions.machine() at +0x100 stays changed: A changed it too\n") != std::string::npos);
+    CHECK(gOut.find("Write Log: A: 1 change(s) undone\n") != std::string::npos);
+    w("A", 150);
+    *v = 7;  // the console or the overlay
+    wlog::leave("A", sink);
+    CHECK(*v == 7 && wlog::records() == 0);
+    CHECK(gOut.find("GameOptions.machine() at +0x100 was changed outside the mods") != std::string::npos);
+    v[0] = 100, v[1] = 9;
+    w("A", 150);
+    uint32_t x = 0x55555555;
+    auto mid = reinterpret_cast<uint8_t*>(v) + 2;  // bytes 2 to 5: half in A's record, half new
+    CHECK(wlog::reserve(wlog::Opt, m, mid, 4, "B"));
+    memcpy(mid, &x, 4);
+    wlog::wrote(mid, &x, 4);
+    CHECK(wlog::records() == 1);
+    wlog::leaveAll(sink);
+    CHECK(v[0] == 100 && v[1] == 9 && wlog::records() == 0);
+    wlog::setBudget(2 * 4 + 64);  // one 4-byte record
+    w("A", 150);
+    CHECK(!wlog::reserve(wlog::Opt, m, reinterpret_cast<uint8_t*>(v + 4), 4, "A"));
+    CHECK(wlog::reserve(wlog::Opt, m, reinterpret_cast<uint8_t*>(v), 4, "B"));  // inside the record it has
+    wlog::leaveAll(sink);
+    CHECK(*v == 100);
+    wlog::setBudget(16 << 20);
+    v[0] = keep[0], v[1] = keep[1];
+    printf("write log ok\n");
+}
+
+// The write log through mods: a reload restores what a mod changed, through a require'd helper, a callback built with
+// load() and Systems.enable; a mod failing while loading takes its load() callback with it and undoes what only it
+// changed, and a value another loaded mod changed too stays until that one leaves; the console isn't logged, and a
+// value it changed since is left alone.
+void checkWriteLog(FakeWorld& w) {
+    const char* ga = "11111111-2222-3333-4444-555555555555";
+    uint8_t g[16];
+    CHECK(res::parseGuid(ga, g));
+    refl::Type item = res::typeByName("ItemInfo");
+    auto stack = reinterpret_cast<uint16_t*>(res::data(*res::find(g, item.hash())) + fieldOff(item, "maxStackSize"));
+    uint8_t* aa = opts::machine() + pathOff(opts::machineType(), {"graphics", "render", "antiAliasing"});
+    const sys::System& inv = *sys::find("inventory_actions");
+    uint16_t stack0 = *stack;
+    uint8_t aa0 = *aa;
+    CHECK(stack0 != 77 && stack0 != 150 && aa0 != 0 && aa0 != 3 && sys::isOn(inv));
+    rt::setSystemsAvailable(true);
+    std::string mods = freshMods(), get = std::string("Res.get('") + ga + "', 'ItemInfo')";
+    writeFile(mods + "\\lw_a", "helper.lua", ("return {set = function(v) " + get + ".maxStackSize = v end}\n").c_str());
+    writeFile(mods + "\\lw_a", "init.lua", "require('helper').set(77)\nSystems.enable('inventory_actions', false)\n"
+              "Tick.add(load(\"return function() GameOptions.machine().graphics.render.antiAliasing = 'None' end\")())\n");
+    rt::requestReload();
+    rt::tick(w.addr());
+    rt::tick(w.addr());
+    CHECK(*stack == 77 && *aa == 0 && !sys::isOn(inv) && wlog::records() == 3);
+    removeTree(mods + "\\lw_a");
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(*stack == stack0 && *aa == aa0 && sys::isOn(inv) && wlog::records() == 0);
+    CHECK(gOut.find("Write Log: 3 change(s) undone\n") != std::string::npos);
+    writeFile(mods + "\\lw_b", "init.lua",
+              (get + ".maxStackSize = 200\nGameOptions.machine().graphics.render.antiAliasing = 'None'\n").c_str());
+    writeFile(mods + "\\lw_c", "init.lua", (get + ".maxStackSize = 150\nSystems.enable('inventory_actions', false)\n"
+              "Tick.add(load(\"return function() print('lw_c tick ran') end\")())\nerror('lw_c fails')\n").c_str());
+    rt::requestReload();
+    rt::tick(w.addr());
+    rt::tick(w.addr());
+    CHECK(gOut.find("Mod Failed: lw_c") != std::string::npos && gOut.find("lw_c tick ran") == std::string::npos);
+    CHECK(gOut.find("Test_Wood_Log at +0x") != std::string::npos &&
+          gOut.find("stays changed: lw_b changed it too\n") != std::string::npos);
+    CHECK(gOut.find("Write Log: lw_c: 1 change(s) undone\n") != std::string::npos);
+    CHECK(*stack == 150 && *aa == 0 && sys::isOn(inv) && wlog::records() == 2);
+    rt::queue("GameOptions.machine().graphics.render.antiAliasing = 3");
+    rt::tick(w.addr());
+    CHECK(*aa == 3 && wlog::records() == 2);
+    removeTree(mods + "\\lw_b");
+    removeTree(mods + "\\lw_c");
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(*stack == stack0 && *aa == 3 && wlog::records() == 0);
+    CHECK(gOut.find("was changed outside the mods (console, overlay or the game): Left as it is\n") != std::string::npos);
+    *aa = aa0;
+    rt::setSystemsAvailable(false);
+    removeTree(gTmp);
+    printf("write log through mods ok\n");
+}
+
+std::string readText(const std::string& path) {
+    std::string text;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return text;
+    char buf[4096];
+    for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+    fclose(f);
+    return text;
+}
+
+const char* kSettingsMod = R"lua(
+    local s = Settings.define{
+        {key = "god", type = "bool", label = "God mode"},
+        {key = "regen", type = "number", min = 0, max = 100, default = 5},
+        {key = "count", type = "int", min = 1, max = 10, default = 3},
+        {key = "mode", type = "choice", values = {"off", "slow", "fast"}},
+        {key = "name", type = "text", max = 4},
+        onChange = function(k, v)
+            print("st change", k, v)
+            Systems.enable("inventory_actions", false)
+        end,
+    }
+    print("st read", s.god, s.regen, s.count, s.mode, s.name, math.type(s.count))
+    print("st again", pcall(Settings.define, {{key = "x", type = "bool"}}))
+    print("st clamp", pcall(function() s.count = 99 end), s.count)
+    print("st wrong", select(2, pcall(function() s.god = 1 end)))
+    print("st badchoice", select(2, pcall(function() s.mode = "turbo" end)))
+    print("st nokey", select(2, pcall(function() return s.nope end)))
+    print("st inf", select(2, pcall(function() s.regen = math.huge end)), s.regen)
+    local f = io.open("settings.json")
+    local canRead = f ~= nil
+    f:close()
+    print("st io", io.open("settings.json", "w") == nil, io.open("SETTINGS.JSON. ", "a+") == nil, canRead)
+    Tick.add(function()
+        if _G.SETR then s.regen, _G.SETR = _G.SETR, nil end
+    end)
+)lua";
+
+// Settings.define: values read back from settings.json (clamped, cut at a character, a wrong type back to its
+// default, unknown keys kept), saved at once and then at most once a second, with a reload flushing a change made
+// sooner; a leftover .tmp is ignored; the mod's io can't write the file; an overlay edit reaches onChange as the mod
+// (its write is undone on reload); a broken file is renamed and the defaults used; a mod failing while loading still
+// saves and its page goes.
+void checkSettings(FakeWorld& w) {
+    std::string mods = freshMods(), dir = mods + "\\st", file = dir + "\\settings.json";
+    const sys::System& inv = *sys::find("inventory_actions");
+    rt::setSystemsAvailable(true);
+    writeFile(dir, "init.lua", kSettingsMod);
+    writeFile(dir, "settings.json", "\xEF\xBB\xBF{\"god\": true, \"regen\": 500, \"count\": \"x\", \"mode\": \"fast\", "
+                                    "\"extra\": {\"a\": [1, 2]}, \"name\": \"abc\\u00e9\"}");
+    writeFile(dir, "settings.json.tmp", "{{{ an interrupted save");
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(gOut.find("st read\ttrue\t100.0\t3\tfast\tabc\tinteger\n") != std::string::npos);
+    CHECK(gOut.find("Settings: st: 'count' in settings.json isn't an integer, using the default\n") != std::string::npos);
+    CHECK(gOut.find("st again\tfalse\tSettings.define: once per mod\n") != std::string::npos);
+    CHECK(gOut.find("st clamp\ttrue\t10\n") != std::string::npos);
+    CHECK(gOut.find("st wrong\tst/init.lua:16: Settings: 'god' takes a boolean\n") != std::string::npos);
+    CHECK(gOut.find("st badchoice\tst/init.lua:17: Settings: 'mode' takes one of its values\n") != std::string::npos);
+    CHECK(gOut.find("st nokey\tst/init.lua:18: Settings: no setting 'nope'\n") != std::string::npos);
+    CHECK(gOut.find("st inf\tst/init.lua:19: Settings: 'regen' takes a finite number\t100.0\n") != std::string::npos);
+    CHECK(gOut.find("st io\ttrue\ttrue\ttrue\n") != std::string::npos);
+    const char* saved = "{\n  \"count\": 10,\n  \"extra\": {\"a\":[1,2]},\n  \"god\": true,\n  \"mode\": \"fast\",\n"
+                        "  \"name\": \"abc\",\n  \"regen\": 100\n}\n";
+    CHECK(readText(file) == saved);  // the first change is saved at once
+    CHECK(GetFileAttributesA((file + ".tmp").c_str()) == INVALID_FILE_ATTRIBUTES);
+    rt::queue("SETR = 42");
+    rt::tick(w.addr());
+    CHECK(readText(file) == saved);  // within a second of the last save: not yet
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(readText(file).find("\"regen\": 42\n") != std::string::npos);  // flushed by the reload
+    CHECK(gOut.find("st read\ttrue\t42.0\t") != std::string::npos);
+    CHECK(gOut.find("st change") == std::string::npos);  // the mod's own writes don't call onChange
+    CHECK(mset::set("st", "mode", 0, "", true) && sys::isOn(inv));
+    rt::tick(w.addr());
+    CHECK(gOut.find("st change\tmode\toff\n") != std::string::npos && !sys::isOn(inv) && wlog::records() == 1);
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(sys::isOn(inv) && gOut.find("Write Log: 1 change(s) undone\n") != std::string::npos);  // counted for st
+    CHECK(gOut.find("st read\ttrue\t42.0\t10\toff\t") != std::string::npos);
+    writeFile(dir, "settings.json", "{\"god\": tru");
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(gOut.find("Settings: st\\settings.json couldn't be read (json: unexpected character at position 9): Renamed "
+                    "to settings.json.bad, using the defaults\n") != std::string::npos);
+    CHECK(readText(file + ".bad") == "{\"god\": tru");
+    CHECK(gOut.find("st read\tfalse\t5.0\t3\toff\t\tinteger\n") != std::string::npos);
+    writeFile(mods + "\\sf", "init.lua", "local s = Settings.define{{key = 'x', type = 'bool'}}\ns.x = true\nerror('sf fails')\n");
+    rt::requestReload();
+    rt::tick(w.addr());
+    CHECK(gOut.find("Mod Failed: sf") != std::string::npos && !mset::has("sf") && mset::has("st"));
+    CHECK(readText(mods + "\\sf\\settings.json") == "{\n  \"x\": true\n}\n");
+    rt::setSystemsAvailable(false);
+    removeTree(gTmp);
+    printf("settings ok\n");
+}
+
+// One tick as the world-tick hook runs it: the Lua tick, then the inspector with the world and session Lua had.
+std::shared_ptr<const insp::View> inspTick(FakeWorld& w, uint64_t sessionShift = 0) {
+    rt::tick(w.addr());
+    uint64_t session = 0;
+    uintptr_t world = rt::readyWorld(session);
+    insp::tick(world, session + sessionShift);
+    return insp::view();
+}
+
+// Entity 1 (the player, with Health and CurrentTransform) leaves the entity map, or comes back under the same id.
+void setPresent(FakeWorld& w, bool on) {
+    for (int s = 0; s < 64; s++) {
+        if (w.ents.keys[s] != 1 || !w.ents.vals[s]) continue;
+        uint64_t bit = 1ull << s;
+        if (on == bool(w.ents.bits & bit)) return;
+        w.ents.bits ^= bit;
+        reinterpret_cast<uint32_t*>(w.world + 0x148)[0x54 / 4] += on ? 1 : uint32_t(-1);
+    }
+}
+
+// The list: nearest first, filter, id search. The selected entity's expanded components, the byte budget.
+void checkInspectorList(FakeWorld& w) {
+    insp::tune(0, 0, 1 << 20);
+    insp::setOpen(true);
+    auto v = inspTick(w);
+    CHECK(v->inWorld && v->rows.size() == 2 && v->matched == 2);
+    CHECK(v->rows[0].id == 1 && v->rows[0].dist == 0 && v->rows[0].hasHp && v->rows[0].pos[0] == 10 && v->rows[0].pos[2] == -3);
+    CHECK(v->rows[1].dist < 0 && !v->rows[1].hasHp && v->rows[0].comps == 4 && v->rows[0].faction == -1);
+    insp::setFilter("Health", 0);
+    CHECK(inspTick(w)->rows.size() == 1);
+    insp::setFilter("NoSuchComponent", 0);
+    CHECK(inspTick(w)->rows.empty());
+    insp::setFilter("", 1);
+    v = inspTick(w);
+    CHECK(v->rows.size() == 1 && v->rows[0].id == 1);
+    insp::setFilter("", 0);
+    uint32_t health = refl::byName("Health").hash();
+    insp::select(1);
+    insp::expand(health, true);
+    v = inspTick(w);
+    CHECK(v->sel == 1 && !v->selGone && v->comps.size() == 4);
+    for (const insp::Comp& c : v->comps) {
+        bool hp = c.hash == health;
+        CHECK(c.open == hp && c.data.size() == (hp ? 40u : 0u) && !c.truncated);
+        if (hp) CHECK(memcmp(c.data.data(), w.hp(), 40) == 0);
+    }
+    insp::tune(0, 0, 8);  // past the budget: marked, and keeps its last copy
+    v = inspTick(w);
+    for (const insp::Comp& c : v->comps)
+        if (c.hash == health) CHECK(c.truncated && c.data.size() == 40);
+    insp::tune(0, 0, 1 << 20);
+    printf("inspector list ok\n");
+}
+
+// Edits and pins on entity 1's Health.dataStorage[0]; gone when the id leaves, and still gone when it comes back.
+void checkInspector(FakeWorld& w) {
+    checkInspectorList(w);
+    uint32_t health = refl::byName("Health").hash(), off = 0;
+    refl::Type leaf;
+    CHECK(refl::path(refl::byName("Health"), "dataStorage[0]", off, leaf) && off == 8);
+    int32_t* hp = reinterpret_cast<int32_t*>(w.hp() + 8);
+    auto v = inspTick(w);
+    int32_t was = *hp, to = 123, stale = was + 1;
+    insp::edit(v->selSerial, health, off, leaf, &was, &to, "Health.dataStorage[0]");
+    v = inspTick(w);
+    CHECK(*hp == 123 && v->note == "Health.dataStorage[0]: Set to 123");
+    insp::edit(v->selSerial, health, off, leaf, &stale, &was, "hp");
+    CHECK(inspTick(w)->note == "hp: Not changed, it changed since you looked (now 123)" && *hp == 123);
+    insp::pin(1, health, off, leaf, "Health.dataStorage[0]");
+    v = inspTick(w);
+    CHECK(v->pins.size() == 1 && v->pins[0].have && !v->pins[0].gone && memcmp(v->pins[0].value, hp, 4) == 0);
+    uint64_t serial = v->selSerial;
+    setPresent(w, false);
+    v = inspTick(w);
+    CHECK(v->selGone && v->pins[0].gone && v->comps.empty());
+    setPresent(w, true);  // the same id again: a new object as far as anyone can tell
+    insp::edit(serial, health, off, leaf, hp, &was, "hp");
+    v = inspTick(w);
+    CHECK(v->selGone && v->pins[0].gone && *hp == 123 && v->note.find("that entity is gone") != std::string::npos);
+    insp::select(1);  // selected again: a new serial, editable
+    v = inspTick(w);
+    CHECK(!v->selGone && v->selSerial != serial);
+    insp::edit(v->selSerial, health, off, leaf, hp, &was, "hp");
+    v = inspTick(w, 1);  // another session in between: gone
+    CHECK(v->selGone && *hp == 123 && v->note.find("that entity is gone") != std::string::npos);
+    insp::unpin(1, health, off);
+    CHECK(inspTick(w)->pins.empty());
+    insp::tick(0, 0);  // no world you host
+    CHECK(!insp::view()->inWorld && insp::view()->rows.empty());
+    insp::setOpen(false);
+    printf("inspector edits ok\n");
 }
 
 void checkHooks(uintptr_t base);
@@ -1756,13 +2318,18 @@ int checkPatterns(const char* path) {
     found = opts::findLayout(base);
     row("options layout", found,
         "slots at " + hex(opts::slotsAt) + ", " + hex(opts::slotSize) + " apart, has-value at " + hex(opts::hasAt));
+    // Any listed build's contract: on a new build, the one that still matches is where re-verifying starts.
+    for (const auto& s : contracts::check(base, gameBuild(base), contracts::catalog(), true))
+        row(("catalog " + s.name).c_str(), s.fn != 0,
+            s.fn ? at(s.fn) + " (contract of " + std::to_string(s.contract) + ")" : s.why);
+    printf("catalog: %zu entries\n", contracts::catalog().size());
     return bad ? 1 : 0;
 }
 
 int main(int argc, char** argv) {
     if (argc == 2 && strcmp(argv[1], "--hooks-read-fault") == 0) return checkHookReadFault();
     if (argc == 2 && strcmp(argv[1], "--hooks-limits") == 0) return checkHookLimits();
-    if (argc == 2 && strcmp(argv[1], "--av") == 0) return checkAccessViolation();
+    if (argc == 3 && strcmp(argv[1], "--av") == 0) return checkAccessViolation(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--patterns") == 0) return checkPatterns(argv[2]);
     if (argc < 2) {
         printf("usage: runtime_selftest <copy of enshrouded.exe> | --patterns <any enshrouded.exe copy>\n");
@@ -1792,10 +2359,12 @@ int main(int argc, char** argv) {
     checkTypes(w);
     checkMenu();
     checkTick(w);
+    checkReadPoint(w);
     checkBindings(w);
     checkEvents(w);
     checkLuaEvents(w);
     checkKeys();
+    checkReport();
     checkDraw(w);
     checkAdminFlow(w);
     checkAdminSend(w);
@@ -1810,14 +2379,21 @@ int main(int argc, char** argv) {
     checkSystems(base);
     std::string hookPattern = luaHookPattern();
     checkLuaHooks(w);
+    checkLuaRules(w);
+    checkLuaCatalogRules(w);
     checkHookCallbacks(w, hookPattern);
     checkHookDrawAndWorld(w);
+    checkFeatures(w, base);
+    checkWriteLogCore();
+    checkWriteLog(w);
+    checkSettings(w);
+    checkInspector(w);
     checkModJson(w);
     checkClosing(w);
     char self[MAX_PATH];
     CHECK(GetModuleFileNameA(nullptr, self, MAX_PATH));
     fflush(stdout);  // keeps this output ahead of the child's
-    CHECK(_spawnl(_P_WAIT, self, ("\"" + std::string(self) + "\"").c_str(), "--av", nullptr) == 0);
+    CHECK(_spawnl(_P_WAIT, self, ("\"" + std::string(self) + "\"").c_str(), "--av", ("\"" + std::string(argv[1]) + "\"").c_str(), nullptr) == 0);
     CHECK(_spawnl(_P_WAIT, self, ("\"" + std::string(self) + "\"").c_str(), "--hooks-limits", nullptr) == 0);
     CHECK(_spawnl(_P_WAIT, self, ("\"" + std::string(self) + "\"").c_str(), "--hooks-read-fault", nullptr) == 0);
     FreeLibrary(exe);

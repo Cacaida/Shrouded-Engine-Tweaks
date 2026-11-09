@@ -14,9 +14,31 @@ body:
     attributes:
       label: set.log
       description: >
-        Drag in `<game folder>\shrouded_engine_tweaks\set.log`. If the game crashed, send `set.prev.log` instead:
-        the restart replaced set.log.
-      placeholder: Drop the file here.
+        In the overlay, Settings > Bug Report > Copy to Clipboard, then paste here. After a crash, use the Last
+        Session window at the next start (or Copy last session's logs). Or drag in
+        `<game folder>\shrouded_engine_tweaks\set.log` (`set.prev.log` after a crash). How to get it:
+        https://github.com/Cacaida/Shrouded-Engine-Tweaks/blob/master/docs/reporting.md
+      placeholder: Paste the log or drop the file here.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: System
+      options:
+        - Windows
+        - Linux or Steam Deck (Proton)
+    validations:
+      required: true
+  - type: dropdown
+    id: admin
+    attributes:
+      label: Do Steam or the game run as administrator?
+      description: Right-click > Run as administrator, or the exe's Properties > Compatibility.
+      options:
+        - "No"
+        - "Yes"
+        - Not sure
     validations:
       required: true
   - type: input
@@ -24,21 +46,20 @@ body:
     attributes:
       label: Versions
       description: The first two lines of set.log, or Settings > Status in the overlay (Runtime and Game Build).
-      placeholder: "Shrouded Engine Tweaks 0.1.0, game build 1793791052"
+      placeholder: "Shrouded Engine Tweaks 0.2.0, game build 1793791052"
     validations:
       required: true
   - type: input
     id: gpu
     attributes:
       label: GPU
+      description: From 0.1.2 on, set.log has it on its GPU line.
       placeholder: "e.g. NVIDIA RTX 3070, driver 566.36"
-    validations:
-      required: true
   - type: input
     id: overlays
     attributes:
       label: Other overlays and mods
-      description: Steam, Discord, RTSS/Afterburner, ReShade, other Enshrouded mods, and which SET mods you had loaded.
+      description: Steam, Discord, RTSS/Afterburner, ReShade, other Enshrouded mods, DLLs in plugins\, and which SET mods you had loaded.
   - type: textarea
     id: status
     attributes:

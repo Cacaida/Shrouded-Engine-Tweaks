@@ -58,6 +58,9 @@ void forFields(Type t, const std::function<void(const Field&)>& fn);  // base cl
 void forEnum(Type t, const std::function<void(std::string_view name, int64_t value)>& fn);  // an enum's values
 // A wrapper struct (one field named value, id or index: EntityId {id}, Time {value}) as its field's type; else t.
 Type unwrap(Type t);
+// A value inside t by path ("dataStorage[0]", "transform.position.x"): its offset and its type, a wrapper unwrapped.
+// Static arrays only; false if any step doesn't exist.
+bool path(Type t, std::string_view path, uint32_t& off, Type& leaf);
 uint32_t fnv(std::string_view s);
 bool enumHas(Type t, int64_t v);              // one of the enum's values; an enum that lists none takes any
 std::string text(const uint8_t* p, Type u);  // a scalar as text: numbers, bools, bitmasks in hex, enums by name
@@ -219,6 +222,14 @@ uint8_t* component(uintptr_t world, uint32_t entity, int idx);  // null if the e
 uint32_t firstWith(uintptr_t world, int idx);                   // first entity with the component, 0 if none
 std::vector<uint32_t> allWith(uintptr_t world, const int* idx, size_t n);  // entities with all n components
 uint32_t entityCount(uintptr_t world);
+// The inspector's walk: the entity map's value (record) for an id, 0 if missing; the used slots in [from, to) as
+// fn(id, record), returning the map's capacity (0 if it doesn't look like one); a record's component indices and
+// where one sits; and per component index its type hash (0 if none), from the schema's component map.
+uintptr_t record(uintptr_t world, uint32_t entity);
+uint64_t forSlots(uintptr_t world, uint64_t from, uint64_t to, const std::function<void(uint32_t, uintptr_t)>& fn);
+std::vector<int> recordComps(uintptr_t rec);
+uint8_t* inRecord(uintptr_t rec, int idx);
+std::vector<uint32_t> compHashes(uintptr_t world);
 
 // Events. Streams hold this tick's events from the start of the world tick until
 // the session clears them after it, so forEachEvent belongs right after the tick.

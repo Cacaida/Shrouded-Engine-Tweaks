@@ -1,33 +1,56 @@
 # Modding guide
 
-A mod is a folder with an `init.lua`, in `<game>\shrouded_engine_tweaks\mods\`. Mods are plain Lua 5.4. The full list
-of functions is in [api-reference.md](api-reference.md).
+A mod is a folder with an `init.lua` file in `<game>\shrouded_engine_tweaks\mods\`. Mods are written in Lua 5.4; if
+Lua is new to you, [Programming in Lua](https://www.lua.org/pil/) is a good start. Every function is listed in the
+[API reference](api-reference.md).
+
+## Words you'll see
+
+| Word | Meaning |
+|---|---|
+| **Entity** | Anything that exists in a world: you, an enemy, a chest, a plant. Each has a number, its id. |
+| **Component** | A piece of data an entity has, like `Health` or `Faction`. You read and change entities through them. |
+| **Resource** | The game's fixed data, the same in every world: item stats, recipes, perks, enemy types, loot tables. |
+| **System** | One piece of game logic that runs over and over, like stamina drain or fall damage. |
+| **Tick** | One step of the game world. The game runs many per second. |
+| **A world you host** | A world running on your PC: single-player, or the server your game hosts. Only these can be changed. |
+| **Hook, rule** | Advanced: watching or changing one of the game's own functions as it runs. |
 
 ## Your first mod
 
-`mods\myheal\init.lua`:
+Create `mods\hello\init.lua`:
 
 ```lua
-local player, hp, maxHp, healNow = nil, 0, 0, false
+print("Hello from my first mod!")
+Keys.on("F6", function() print("You pressed F6") end)
+```
 
--- The player picks the key in the overlay's Bindings window.
+Start the game and open the overlay: the console shows your line and `Mod Loaded: hello`. Close the overlay, press F6,
+and open it again to see the second line. After editing the file, press **Reload Mods** (or type `reload()`) instead
+of restarting the game.
+
+Now one that changes the game: a key that heals you.
+
+```lua
+local hp, maxHp, healNow = 0, 0, false
+
+-- You pick the key in the overlay's Bindings window.
 Keys.hotkey("heal", "Heal to full", function() healNow = true end)
 
--- Every server tick in a world you host (every frame at the main menu, where there's no player): read and change the
--- game here.
+-- Runs every tick. This is where you read and change the game.
 Tick.add(function()
-    player = player or Ecs.player()
+    local player = Ecs.player()
     local h = player and Ecs.get(player, "Health")
-    if not h then player = nil return end
+    if not h then return end              -- no player: at the main menu, or still loading
     if healNow then
-        -- slot 0 = current HP, slot 2 = max HP before gear and buffs: only ever raise HP to it
+        -- slot 0 is current HP, slot 2 max HP without gear and buffs: only ever raise HP to it
         h.dataStorage[0] = math.max(h.dataStorage[0], h.dataStorage[2])
         healNow = false
     end
     hp, maxHp = h.dataStorage[0], h.dataStorage[2]
 end)
 
--- Every frame while the overlay is open: show what Tick read. Never touch the game here.
+-- Runs every frame. This is where you draw windows; it can't touch the game.
 Draw.add(function()
     if not Overlay.isOpen() then return end
     if ImGui.Begin("My heal") then
@@ -38,201 +61,194 @@ Draw.add(function()
 end)
 ```
 
-Open the overlay: the console shows `Mod loaded: myheal`. Bind **Heal to full** in **Bindings**. After editing the
-file, type `reload()` or press **Reload Mods**.
-
 ## Tick and Draw
 
-Two places run your code, on different threads:
+Your code runs in two places, at different times:
 
-| | `Tick.add` / `onUpdate` | `Draw.add` / `onDraw` |
+| | `Tick.add` | `Draw.add` |
 |---|---|---|
-| When | every server tick in a world you host, every frame elsewhere | every frame, on the render thread |
-| Game access | yes | no: `Ecs.*` and component views raise an error |
-| ImGui | no | yes |
+| When | every tick in a world you host, every frame elsewhere | every frame |
+| Can touch the game (`Ecs`) | yes | no, it raises an error |
+| Can draw windows (`ImGui`) | no | yes |
 
-So read the game in Tick, keep what you need in variables, and show those in Draw. A button sets a flag that the next
-Tick acts on. `Admin.*` is the exception: it only queues, so a button can call it directly. `Res`, `GameOptions`,
-`Types` and `Systems` work in both.
+So read the game in Tick, keep what you need in variables, and show those in Draw. A button sets a flag (like
+`healNow` above), and the next Tick acts on it. `Res`, `GameOptions`, `Types` and `Systems` work in both, and so do
+most `Admin` commands.
 
-## When mods load, and what works where
+## What works where
 
-Mods load once, at the main menu, as soon as the game's resources are in, and stay loaded until the game closes.
-Entering and leaving worlds doesn't reload them.
+Mods load once, at the main menu, and stay loaded until the game closes. Entering or leaving a world doesn't reload
+them.
 
-| | Main menu and loading | In a world you host |
+| | Main menu | In a world you host |
 |---|---|---|
-| `Tick.add`, `onUpdate` | every frame, on the main thread | every server tick |
-| Console, `Keys`, hotkeys, `Draw`, overlay events | yes | yes |
-| `Res`, `GameOptions`, `Types`, `Systems`, `io`, `json`, `GetMod`, `reload()` | yes | yes |
-| `Ecs.player`, `Ecs.get`, `Ecs.each` | nil, or an empty loop | yes |
-| `Events.post`, `Admin.*` | an error: "not in a world you host" | yes |
-| `Observe` handlers | registered, not called | after each server tick |
-| `Hooks` handlers | before Tick when observations are queued | before Tick when observations are queued |
+| `Tick.add` | every frame | every tick |
+| Console, keys, `Draw`, `Res`, `GameOptions`, `Types`, `Systems`, files | yes | yes |
+| `Ecs.player`, `Ecs.get`, `Ecs.each` | nil, or nothing to loop over | yes |
+| `Events.post`, `Admin.*` | error: "not in a world you host" | yes |
+| `Observe` handlers | not called | after each tick |
 
-- A world someone else hosts counts as the main menu: only worlds you host are reachable.
-- So a tick that uses the game looks for the player first: `local p = Ecs.player() if not p then return end`.
+A world someone else hosts counts as the main menu. That's why a Tick that uses the game checks for the player first:
+`local p = Ecs.player() if not p then return end`.
 
 ## Lifecycle events
 
 ```lua
-registerForEvent("onInit", function() other = GetMod("other") end)   -- every mod's init.lua has run
-registerForEvent("onWorldEnter", function() inWorld = true end)      -- first tick of a world you host
-registerForEvent("onWorldLeave", function() inWorld = false end)     -- you left; the world is going away
-registerForEvent("onShutdown", function() --[[ save files ]] end)    -- reload() or the game closing
+registerForEvent("onInit", function() end)        -- every mod's init.lua has run
+registerForEvent("onWorldEnter", function() end)  -- you entered a world you host
+registerForEvent("onWorldLeave", function() end)  -- you're leaving it
+registerForEvent("onShutdown", function() end)    -- your mod is about to stop: save your files here
 ```
 
 | Event | When |
 |---|---|
-| `onInit` | Once every mod's `init.lua` has run: at the main menu at startup, and after `reload()` |
-| `onUpdate(dt)` | Like `Tick.add`; `dt` is seconds since the previous one |
+| `onInit` | Once every mod's `init.lua` has run, at startup and after a reload |
+| `onUpdate(dt)` | Like `Tick.add`; `dt` is the seconds since the last one |
 | `onDraw` | Like `Draw.add` |
-| `onOverlayOpen`, `onOverlayClose` | At the first tick after the overlay opens or closes |
-| `onWorldEnter` | The first tick of a world you host (a respawn doesn't count), and after `reload()` in a world. The player may take a few ticks to exist |
-| `onWorldLeave` | The moment you leave. `Ecs.*` and `Events.post` raise "the world is closing"; `Res` and `GameOptions` still work |
-| `onShutdown` | Right before your mod is unloaded. When the game closes, only files are left: save from what you have in memory |
+| `onOverlayOpen`, `onOverlayClose` | The first tick after the overlay opens or closes |
+| `onWorldEnter` | The first tick in a world you host, and after a reload in one. The player can take a few ticks to appear |
+| `onWorldLeave` | The moment you leave. `Ecs` and `Events.post` stop working here; `Res` and `GameOptions` still work |
+| `onShutdown` | Right before your mod stops (a reload, or the game closing). At game close only files still work |
 
-- Register events at the top of `init.lua`. Other names raise an error.
-- On a crash or a killed process, `onShutdown` doesn't run: save when your data changes, and use `onShutdown` as a
-  last save.
+Register events at the top of `init.lua`. After a crash, `onShutdown` doesn't run, so save when your data changes too.
 
-## Mods side by side
+## Several mods together
 
-- **Each mod has its own globals.** A global you set stays in your mod; reads fall back to the shared API.
-- **The shared API is read-only:** `Ecs.player = myFunction` raises an error, so one mod can't break another. Keep
-  your own functions in your own table.
-- **`require("util")`** loads `util.lua` (or `util\init.lua`) from your mod's folder, once per mod.
-- **`GetMod("other")`** gives what `mods\other\init.lua` returned. Mods load in folder order, so call it from
-  `onInit`.
-- **Errors** are printed with your file and line (`myheal/init.lua:12: ...`). A callback that errors is removed, and
-  the line names your mod.
+- **Each mod has its own globals,** so two mods can use the same variable names.
+- **The shared API can't be changed:** `Ecs.player = something` raises an error, so one mod can't break another.
+- **`require("util")`** loads `util.lua` from your mod's folder.
+- **`GetMod("other")`** gives what another mod's `init.lua` returned. Call it in `onInit`, when every mod has loaded.
+- **Errors** show your file and line (`hello/init.lua:12: ...`), and the function that failed is removed. The game
+  keeps running.
+
+## When your mod stops, its changes go back
+
+What your mod changes in resources, game options and systems goes back to the game's value when your mod stops:
+
+- on **Reload Mods** or `reload()`, after your `onShutdown` (so your own clean-up runs first);
+- when your mod **fails while loading**.
+
+Not when the game closes: there's nothing to put back then. Changes you make yourself in the console or the overlay
+aren't undone. If two mods change the same value, it goes back when the last of them stops. Entity data isn't undone:
+entities come and go with the world anyway.
 
 ## Finding the game's data
 
-Everything comes from the game's own type data, so the console can tell you what exists:
+The game describes all of its own data, so the console can tell you what exists:
 
 ```lua
-Ecs.types("player")        -- search type names
-Ecs.fields("Health")       -- a type's fields with offsets, base classes included
-Ecs.get(Ecs.player(), "Health").dataStorage   -- arrays print their values
-Res.types("item")          -- resource types, with how many the game has
-local g, logs = Res.find("ItemInfo", "Wood Logs") print(g, logs.debugName, logs.maxStackSize)
+Ecs.types("player")        -- search component and type names
+Ecs.fields("Health")       -- the fields of a type
+Ecs.get(Ecs.player(), "Health").dataStorage   -- print a value
+Res.types("item")          -- resource types, and how many of each
+local g, logs = Res.find("ItemInfo", "Wood Logs") print(g, logs.maxStackSize)
 print(Res.text(logs.description))   -- the English text of a name or description
 for _, n in ipairs(Systems.list("stamina")) do print(n) end
 ```
 
-The overlay's **Resources** window shows the same resources with every field, and **Systems** every system.
+The overlay's **Resources**, **Entities** and **Systems** windows show the same data, with every field.
 
-## Observing native functions
+## Options and files
 
-Hooks tell your mod **that** a game function ran and **with which arguments**. You react on the next tick, with
-everything else the API offers. They watch; they don't change the call.
-
-| You can | You can't |
-|---|---|
-| React to game actions that have no event or readable component, e.g. "a craft was attempted", failed ones included | Stop, change or replace what the function does |
-| Read its arguments: integers, floats, bools, entity ids, strings, copies of reflected structs up to 1 KB | See its return value, so whether the call succeeded |
-| Act on it at the next tick: `Ecs.get`, `Admin.*`, `Res`, `Systems`, your own state and UI | Run code at the moment of the call; delivery is always one tick later |
-| Count calls, see who made them, and measure the capture cost in the **Hooks** window | Keep a pattern working across game updates without checking it again |
-
-A function only tells you what its entry sees. A crafting function that also handles failed attempts reports those
-too: filter in your handler (by entity, for example), or pick a target that only runs on the outcome you want. If the
-game already posts an event for that outcome, `Observe` is simpler and survives game updates better: finished crafts,
-for example, arrive as `CraftRecipeSuccessEvent` and pickups as `PickupEvent` ([Events](api-reference.md#events)).
-
-`Hooks.observe` registers an entry observer from your mod's initialization or normal tick work. Declare a unique name,
-a verified entry pattern, argument types, a bounded queue capacity and a handler. See the
-[native hooks reference](api-reference.md#native-hooks) for the complete shape and supported types. You cannot
-register from Draw, the console or shutdown. Keep UI actions in flags that Tick processes.
-
-Find and verify a target's calling convention and argument semantics before writing its declaration. Reflection only
-describes data layouts. Ordinary Windows x64 calls support up to eight declared positions, including implicit object
-and hidden return pointers. Skip unused positions explicitly. A readable snapshot may still be inconsistent or refer
-to the wrong object. Copied entity ids provide no lifetime or current-world guarantee.
-
-The original function runs immediately after capture. Your handler receives independent Lua-owned copies later,
-before ordinary Tick callbacks, and can retain or edit them. It cannot override the native call. Keep handlers short:
-queues are bounded, and overflow drops events. Check `ev.dropped` and the overlay's **Hooks** window.
-
-Removal and handler errors stop delivery immediately. Reload deactivates old handlers before teardown and only
-reactivates matching registrations when the new mod registers them. World transitions discard pending observations.
-Inactive detours stay installed until restart. Keeping the same name, target, arguments and capacity reuses storage;
-changing declarations consumes retained slots. Faulted targets require a restart.
-
-## Saving your mod's files
+**Options** the player can change go through `Settings.define`. They're saved for you, and get a page in the
+overlay's **Mod Settings** window ([reference](api-reference.md#settings)):
 
 ```lua
-local f = io.open("settings.json", "w")   -- mods\<your mod>\settings.json
-f:write(json.encode({volume = 0.5}))
+local s = Settings.define{
+    {key = "volume", type = "number", default = 0.5, min = 0, max = 1, label = "Volume"},
+    onChange = function(key, value) print(key, "is now", value) end,
+}
+print(s.volume)
+```
+
+**Anything else** goes in your own files, inside your mod's folder:
+
+```lua
+local f = io.open("save.json", "w")       -- mods\<your mod>\save.json
+f:write(json.encode({visited = {"a", "b"}}))
 f:close()
 
-local f = io.open("settings.json")        -- nil if it doesn't exist
+local f = io.open("save.json")            -- nil if it doesn't exist yet
 if f then
     local ok, data = pcall(json.decode, f:read("a"))
     f:close()
 end
 ```
 
-`io.open` and `io.lines` work inside your mod's folder only. Paths that could leave it (absolute paths, drives,
-`..`) raise an error.
+Mods can only open files in their own folder, and can't write `settings.json` (that one belongs to
+`Settings.define`).
 
-## The sandbox
+## What mods can't do
 
-Mods are treated as third-party code:
+Mods are treated as code from strangers, so they're limited to:
 
-- **Available:** base Lua, `string`, `table`, `math`, `utf8`, `coroutine`, `json`, `os.time`, `os.clock`, `os.date`,
-  and `io.open` / `io.lines` in your own folder.
-- **Source text only:** mods, `require` and `load` refuse precompiled bytecode.
-- **Not available:** the rest of `io`, `debug`, `dofile`, `loadfile`, `string.dump`, `os.execute`, `os.remove`,
-  `os.rename`, `os.exit`, `os.getenv`, native DLLs.
+- **Lua:** base Lua, `string`, `table`, `math`, `utf8`, `coroutine`, `os.time`, `os.clock`, `os.date`, and `json`.
+- **Files:** `io.open` and `io.lines`, inside your own folder only.
+- **Not available:** the rest of `io` and `os`, `debug`, `dofile`, `loadfile`, `string.dump`, DLLs, and precompiled
+  Lua.
 
-## Game versions
+## Game updates
 
-A game update can move or change what your mod relies on: a native hook pattern, more rarely a component or type.
-Most mods that only use `Ecs`, `Res` and the other data APIs keep working across updates.
+A game update can break a mod, mostly ones that hook game functions. Mods that only use `Ecs`, `Res` and the other
+data functions usually keep working.
 
-**`mod.json`** (optional, next to `init.lua`) tells Shrouded Engine Tweaks what your mod was made for:
+**`mod.json`** (optional, next to `init.lua`) says what your mod was made for:
 
 ```json
-{"requires": "0.1.1", "builds": [1793791052]}
+{"requires": "0.2.0", "builds": [1793791052]}
 ```
 
-| Field | When it doesn't match |
-|---|---|
-| `requires`, the oldest Shrouded Engine Tweaks your mod needs | The mod isn't loaded, and `init.lua` doesn't run: `Mod skipped: x (needs Shrouded Engine Tweaks 0.1.1, this is 0.1.0)` |
-| `builds`, the game builds you tested (Status shows the running one) | The mod loads anyway. If it works: `Mod loaded: x (made for game build 1793791052, this is ...)`, in yellow. If it fails while loading: `Mod failed: x (made for game build ..., this is ...: wrong game version?)`, with the error that stopped it on the line above |
+- **`requires`:** the oldest Shrouded Engine Tweaks your mod needs. On an older one, your mod isn't loaded and the
+  console says why.
+- **`builds`:** the game builds you tested. On another build your mod still loads, with a yellow note in the console.
+- **`Features()`** tells your mod what works on this game build ([reference](api-reference.md#features)), so it can
+  turn its own options off instead of failing: `if not Features().admin.compatible then ... end`.
+- **A mod that fails while loading is stopped completely,** so it never half-runs. Let what your mod can't work
+  without fail at load, and use `pcall` only for optional extras.
 
-- **A mod that fails while loading is unloaded completely.** Its Tick, Draw, event handlers, keys and hooks
-  registered before the error stop too, so it never half-runs.
-- **Let what your mod can't work without fail at load.** Call `Hooks.observe` for a hook your mod needs directly at
-  the top of `init.lua`, not inside `pcall`: on a build where its pattern is gone, the mod is reported as not loaded
-  instead of running without it. Use `pcall` only for optional extras.
-- **Several builds:** keep one pattern per build you verified, and pick with `GetGameBuild()`:
+## Hooking game functions (advanced)
+
+Most mods never need this. Hooks reach the game's own code, below everything above:
+
+- **Rules** change a game function's call while it runs: its arguments, its result, or whether it runs at all.
+- **Observers** tell your mod that a function ran, and with which values, at the next tick.
+
+The easy start is a rule on a **catalog target**: a game function Shrouded Engine Tweaks already studied and checks on
+every game build. You just name it:
 
 ```lua
-local DODGE = {[1793791052] = "48 89 5C 24 08 48 89 6C 24 10 ..."}
-local pattern = DODGE[GetGameBuild()] or error("no dodge pattern for game build " .. GetGameBuild())
-Hooks.observe{name = "dodge", pattern = pattern, args = {"skip", "skip", "entity*"}, fn = onDodge}
+-- You take half damage from every hit.
+Hooks.rule{name = "tough skin", target = "hit",
+    when = {{arg = 4, field = "targetId", eq = "player"}},
+    set = {{arg = 4, field = "healthChange", mul = 0.5}}}
+
+-- Kills give double XP; a param changes the factor while the game runs.
+local id = Hooks.rule{name = "xp boost", target = "combat_xp", params = {k = 2}, after = {{mul = "$k"}}}
+Hooks.param(id, "k", 3)
 ```
 
-## Limits
+A rule is data, not a function: the conditions (`when`) and changes (`set`, `after`, `block`) are applied for you,
+instantly, without running Lua inside the game's code.
 
-- **Hosted worlds only** for the game itself (see the table above).
-- **Native hooks observe only:** no inline Lua overrides, return capture or custom register conventions. Patterns
-  belong to one game build: check them again after every game update, and pick them per build with
-  `GetGameBuild()` (see [Game versions](#game-versions)).
-- **Resource edits live in memory:** make them in `onInit`, so they're in place before any world loads. Strings and
-  array lengths can't change size; resources can't be created, cloned or deleted.
-- **Game option changes aren't saved,** and the game's settings menu doesn't show them.
-- **Replication:** writes skip the game's dirty-marking. Some fields only reach other players when the server next
-  touches them.
-- **Slow callbacks hold up the game:** a Tick callback delays the server tick in a world, or the whole frame at the
-  main menu. A Draw callback can delay the next tick, since only one Lua callback runs at a time. Mod windows also pause
-  while a tick runs, but the game itself keeps drawing. Anything over 50 ms gets a yellow line naming your mod.
-- **Cost:** `Ecs.player()`, `Ecs.each`, `Res.find` and `Res.each` walk a whole map per call. Keep their results, and
-  run loops on a key press or a timer, not every tick.
-- **Tick and Draw share one Lua state,** so they wait for each other: keep both short.
-- **Keys** are virtual-key codes, so `` ` `` is a different physical key on non-US layouts.
-- **Paths are ANSI:** characters outside your Windows code page in the game folder's path or a file name keep mods
-  from loading.
+Any other function needs a **pattern**: bytes that find it in the game's exe. Finding one, and the function's
+arguments, takes reverse engineering. A pattern belongs to one game build, so check it again after every update. Your
+own patterns get observers and number-argument rules; changing fields, results or skipping calls works only on catalog
+targets.
+
+Everything else (the catalog list, every option, limits) is in the [API reference](api-reference.md#native-hooks). The
+overlay's **Hooks** window shows what each hook does while you play.
+
+## Good to know
+
+- **Slow code slows the game:** a Tick holds up the game's tick. Anything over 50 ms gets a yellow line naming your
+  mod.
+- **`Ecs.player()`, `Ecs.each`, `Res.find` and `Res.each` search a lot:** keep their results, and loop on a key press or
+  a timer, not every tick.
+- **Resource edits** last until your mod stops. Make them in `onInit`, so they're in place before a world loads. Text
+  and list lengths can't change, and resources can't be added or deleted.
+- **Game option changes** aren't saved, and the game's menu doesn't show them.
+- **Multiplayer:** joined players may not see some changes until the game itself next updates that value.
+- **Keys** are physical keys from a US layout: `` ` `` may be a different key on yours.
+- **Folder names:** characters your Windows language can't show, in the game's path or a file name, stop mods from
+  loading.
 - **English names only** for now.

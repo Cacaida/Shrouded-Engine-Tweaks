@@ -45,8 +45,23 @@ work\build\runtime\Release\overlay_selftest.exe
   scalar/register/stack arguments, hidden return pointers, unchanged returns, nonvolatile registers, unwind metadata,
   copied payloads, faults, queues, reload generations and Lua lifecycle behavior. A child process checks retained
   target/registration limits and the 64 MiB budget. It can also be run directly with `--hooks-limits`.
-  The printed microbenchmark compares unhooked calls, inactive detours, scalar and snapshot capture, and multiple
-  subscribers. It excludes queue drains and Lua execution, and does not establish in-game performance.
+  Rule tests cover the rule engine on its own (order, value conversions, params, id lists under concurrent updates,
+  faults, field changes on and off the stack, a faulting write undoing the ones before it, blocking and return
+  values, return changes), the catalog against the
+  exe (malformed entries, a forced untested build), and rules on real detours: register, XMM and stack arguments,
+  three mods' rules on one value, recursion, a fault committing nothing, a catalog field on the caller's stack, a read-only field
+  refused as a change,
+  blocked calls (every return kind, nonvolatile registers, an exception thrown right after, 8 threads while a block
+  comes and goes), return changes (arity 0 and 8 with mixed kinds, nonvolatile registers, a C++ exception and an
+  access violation inside the original reaching the caller, recursion, 8 threads while the rule comes and goes), 8 calling threads while rules register and go away, retained-slot limits and every refusal. The Lua tests drive
+  `Hooks.rule` through mods, on patterns and on a synthetic catalog.
+  It also checks `Features()` (a forced untested build, world-only features outside a world), the write log (undo on
+  reload and on a failed mod, two mods writing one value in both unload orders, a full budget, nothing undone at game
+  exit), `Settings.define` (saving, clamping, broken files, an interrupted save, the `settings.json` write refusal),
+  the read point's overlap counter, and the Entities window's reads and edits on synthetic entities (the list, the
+  byte budget, and edits refused for a changed value, a gone entity or another world).
+  The printed microbenchmark compares unhooked calls, inactive detours, scalar and snapshot capture, multiple
+  subscribers and rules. It excludes queue drains and Lua execution, and does not establish in-game performance.
 - **`overlay_selftest`** opens a small window and drives a real Vulkan swapchain through the overlay layer, closed and
   open, and checks the export forwarding.
 
@@ -81,7 +96,9 @@ shutdown. Keep a known-good DLL for rollback and replace the installed DLL only 
 |---|---|
 | `runtime/main.cpp` | Loading, logging, the hooks |
 | `runtime/game.cpp`, `game.h` | Game memory: reflection, patterns, ECS, events, resources, options, systems |
-| `runtime/hooks.cpp`, `hooks.h`, `hooks_x64.asm` | Bounded native entry observation, queues and Windows x64 capture stub |
+| `runtime/hooks.cpp`, `hooks.h`, `hooks_x64.asm` | Native entry hooks: rules, bounded observation queues and the Windows x64 stub |
+| `runtime/rules.cpp`, `rules.h` | The interception rule engine |
+| `runtime/contracts.cpp`, `contracts.h` | The catalog of verified interception targets |
 | `runtime/lua_api.cpp` | The Lua API, mod loading and the sandbox |
 | `runtime/lua_imgui.cpp`, `lua_json.cpp` | ImGui and json for mods |
 | `runtime/overlay_vk.cpp` | The overlay's Vulkan layer |

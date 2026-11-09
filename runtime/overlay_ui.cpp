@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -20,8 +22,11 @@
 #include "hooks.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
+#include "inspect.h"
 #include "lua_api.h"
+#include "modsettings.h"
 #include "overlay.h"
+#include "report.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -50,12 +55,36 @@ constexpr char kSettings[] =
     "; Console history: how many entered lines Up and Down remember (1-10000). saveHistory=1 keeps them across game\r\n"
     "; starts in console_history.txt, which holds what you type; 0 forgets them when the game closes.\r\n"
     "historyLimit=100\r\n"
-    "saveHistory=1\r\n";
+    "saveHistory=1\r\n"
+    "; 1 = extra lines in set.log that help with bug reports (overlay key, drawing problems). 0 for normal play.\r\n"
+    "debugLog=1\r\n";
+const wchar_t kGitHubBugs[] = L"https://github.com/Cacaida/Shrouded-Engine-Tweaks/issues/new/choose";
+const wchar_t kNexusBugs[] = L"https://www.nexusmods.com/enshrouded/mods/303?tab=bugs";
 const wchar_t* const kAsyncNames[] = {L"default", L"on", L"off"};  // settings.ini asyncCompute, by Settings value
 
 std::atomic<int> gToggleKey{VK_OEM_3};  // settings.ini overlayKey; ` and ~ on a US layout
-std::string gKeyName = "`";
+std::string gKeyName = "`";  // as the keyboard layout labels it (keyLabel)
 HWND gWnd;
+
+// The keyboard layout the game window's input uses.
+HKL inputLayout() { return GetKeyboardLayout(gWnd ? GetWindowThreadProcessId(gWnd, nullptr) : 0); }
+
+// A key as the player's keyboard layout labels it: the character a punctuation key types there (Ü, ß or ´ on a German
+// layout, ] on a US one), else its name. Only for display: stored names stay the same on every layout (rt::keyName).
+// The character a punctuation key types on that layout, 0 for any other key. The top bit marks a dead key (´ ^).
+wchar_t keyChar(int vk) {
+    bool oem = (vk >= VK_OEM_1 && vk <= VK_OEM_3) || (vk >= VK_OEM_4 && vk <= VK_OEM_8) || vk == VK_OEM_102;
+    return oem ? wchar_t(MapVirtualKeyExW(UINT(vk), MAPVK_VK_TO_CHAR, inputLayout()) & 0xFFFF) : 0;
+}
+
+std::string keyLabel(int vk) {
+    wchar_t c = keyChar(vk);
+    if (c <= L' ') return rt::keyName(vk);
+    CharUpperBuffW(&c, 1);
+    char s[8];
+    int n = WideCharToMultiByte(CP_UTF8, 0, &c, 1, s, sizeof s, nullptr, nullptr);
+    return std::string(s, size_t(std::max(n, 0)));
+}
 WNDPROC gOrig;
 std::atomic<bool> gOpen, gDisabled;
 std::atomic<bool> gAskKey;  // first start: the overlay is open until its key is picked
@@ -65,10 +94,15 @@ bool gAskRefused;           // a key that can't be the overlay key was pressed
 bool gDropChar;  // the WM_CHAR that follows the toggle key must not be typed
 std::string gIni;
 float gScale = 1;  // window height / 1080, applied to the style
+std::atomic<float> gNewScale;  // a new window height's scale (ov::resize), applied before the next frame
+bool gCrashPrompt;             // the last session didn't close normally and the Last Session window wasn't dismissed
+std::atomic<bool> gCrashOnly;  // the overlay opened by itself for that window: only it shows, and closing it closes the overlay
+std::string gReportMsg;
 
 // The built-in windows, toggled from the toolbar.
-enum Win { WinConsole, WinBinds, WinRes, WinSys, WinHooks, WinLog, WinSettings, WinDebug, WinCount };
-const char* const kWinNames[WinCount] = {"Console", "Bindings", "Resources", "Systems", "Hooks", "Game Log", "Settings", "ImGui Debug"};
+enum Win { WinConsole, WinBinds, WinModSet, WinRes, WinEnt, WinSys, WinHooks, WinLog, WinCompat, WinSettings, WinDebug, WinCount };
+const char* const kWinNames[WinCount] = {"Console", "Bindings", "Mod Settings",  "Resources", "Entities",   "Systems",
+                                         "Hooks",   "Game Log", "Compatibility", "Settings",  "ImGui Debug"};
 bool gShow[WinCount] = {true};
 bool gMetrics, gIdStack;
 
@@ -137,14 +171,27 @@ void toggle() {
         gCapture.clear();  // a capture left when the overlay closed
         gHintEnd = 0;      // the key is known now
     }
+    if (!open) gCrashOnly = false;  // closed by its key: the next open is the normal overlay (Last Session included)
     gOpen = open;
     rt::setOverlayOpen(open);
+    ov::log(open ? LV_LOG "Overlay: Opened" : LV_LOG "Overlay: Closed");  // Open/close line
+}
+
+// The overlay key pressed alone. With Ctrl or Shift held it's another binding (another mod's Ctrl+F11), so it passes
+// on; Alt+key comes as WM_SYSKEYDOWN and always did. GetKeyState: the modifiers as of this message.
+bool toggleKeyDown(UINT m, WPARAM w) {
+    return m == WM_KEYDOWN && static_cast<int>(w) == gToggleKey && GetKeyState(VK_CONTROL) >= 0 &&
+           GetKeyState(VK_SHIFT) >= 0 && GetKeyState(VK_MENU) >= 0;
 }
 
 // Open: input goes to ImGui only. WM_INPUT still needs DefWindowProc to free the raw input. System keys (Alt, F10)
 // still go to the game, which only uses them to keep Windows from entering menu mode.
 LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_KEYDOWN && static_cast<int>(w) == gToggleKey && !gDisabled && !gAskKey) {
+    bool toggleKey = toggleKeyDown(m, w);
+    if (toggleKey && (gDisabled || gAskKey) && !(l & (1 << 30)))
+        ov::debug(gDisabled ? "Overlay Key: Ignored, the overlay is off after an error"  // Ignored key
+                            : "Overlay Key: Ignored while the key window is open");
+    if (toggleKey && !gDisabled && !gAskKey) {
         if (!(l & (1 << 30))) toggle();  // bit 30: auto-repeat
         gDropChar = true;
         return 0;
@@ -260,7 +307,7 @@ void drawFind(Lines& l) {
     l.focusFind = false;
     float x = ImGui::GetFrameHeight();
     ImGui::SetNextItemWidth(-(x + ImGui::GetStyle().ItemSpacing.x));
-    if (ImGui::InputTextWithHint("##find", "find: text, a,b = either, -a = hide", l.find.InputBuf, sizeof l.find.InputBuf))
+    if (ImGui::InputTextWithHint("##find", "Find: Text, a,b = either, -a = hide", l.find.InputBuf, sizeof l.find.InputBuf))
         l.find.Build();
     bool esc = ImGui::IsItemDeactivated() && ImGui::IsKeyPressed(ImGuiKey_Escape);
     ImGui::SameLine();
@@ -304,7 +351,7 @@ void drawLines(Lines& l, float footer) {
         l.finding = l.focusFind = true;  // not Shortcut(): an active console input line would keep it
     ImGui::SameLine();
     if (l.finding) drawFind(l);
-    else ImGui::TextDisabled("Ctrl+F: find");
+    else ImGui::TextDisabled("Ctrl+F: Find");
     if (ImGui::BeginChild("lines", ImVec2(0, -footer), ImGuiChildFlags_None, ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
         wrapLines(l, ImGui::GetContentRegionAvail().x);  // the fixed scrollbar keeps the width from flip-flopping
         ImGuiListClipper clip;
@@ -442,21 +489,25 @@ void pollCapture() {
     gCapture.clear();
 }
 
+// The key left of 1, by its place on the keyboard (scan code 0x29): ` on a US layout, ^ on a German one. Not ` by its
+// key code: on a German keyboard that's Ö, which types a letter (in the game's chat, say).
+int leftOfOne() { return int(MapVirtualKeyExW(0x29, MAPVK_VSC_TO_VK, inputLayout())); }
+
 // Keys that type nothing and close no menu. F10 is a system key: the window procedure never gets it as WM_KEYDOWN, so
 // it could never open the overlay.
 bool overlayKeyOk(int vk) {
-    return vk == VK_OEM_3 || (vk >= VK_F1 && vk <= VK_F24 && vk != VK_F10) || vk == VK_INSERT || vk == VK_DELETE ||
+    return vk == leftOfOne() || (vk >= VK_F1 && vk <= VK_F24 && vk != VK_F10) || vk == VK_INSERT || vk == VK_DELETE ||
            vk == VK_HOME || vk == VK_END || vk == VK_PRIOR || vk == VK_NEXT || vk == VK_PAUSE;
 }
 
 void setOverlayKey(int vk) {
     ov::Settings s = ov::readSettings();
     s.keyName = rt::keyName(vk);
-    if (!ov::saveSettings(s)) ov::log(LV_BAD "Settings: saving settings.ini failed, %s works until the game closes", s.keyName.c_str());
-    ov::setToggleKey(vk, s.keyName);
+    if (!ov::saveSettings(s)) ov::log(LV_BAD "Settings: Saving settings.ini failed, %s works until the game closes", s.keyName.c_str());
+    ov::setToggleKey(vk);
     gEditLoaded = false;  // the Settings window shows the new key
     gAskKey = false;
-    ov::log(LV_OK "Overlay key: %s opens and closes the overlay", s.keyName.c_str());
+    ov::log(LV_OK "Overlay Key: %s opens and closes the overlay", gKeyName.c_str());
 }
 
 // First start: a window in the middle that stays until the overlay key is picked. The overlay is open meanwhile, so
@@ -467,12 +518,13 @@ void drawAskKey() {
                  ImGuiWindowFlags_NoSavedSettings;
     if (ImGui::Begin("Overlay Key", nullptr, flags)) {
         ImGui::TextUnformatted("Press the key that opens and closes this overlay.");
-        ImGui::TextDisabled("`  F1-F24 (not F10)  Insert  Delete  Home  End  PageUp  PageDown  Pause");
+        ImGui::TextDisabled("%s  F1-F24 (not F10)  Insert  Delete  Home  End  PageUp  PageDown  Pause",
+                            keyLabel(leftOfOne()).c_str());
         int vk = pressedKey();
         if (vk && rt::heldMods()) vk = 0;  // with Ctrl, Alt or Shift it's another app's hotkey (Alt+F9)
         if (vk && overlayKeyOk(vk)) setOverlayKey(vk);
         else if (vk) gAskRefused = true;
-        if (gAskRefused) ImGui::TextColored(kRed, "That key types text, closes menus or is a system key: pick one above.");
+        if (gAskRefused) ImGui::TextColored(kRed, "That key types text, closes menus or is a system key: Pick one above.");
     }
     ImGui::End();
 }
@@ -485,8 +537,78 @@ void drawHint() {
     ImGui::SetNextWindowBgAlpha(0.6f);
     auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
-    if (ImGui::Begin("##hint", nullptr, flags)) ImGui::Text("Shrouded Engine Tweaks: %s opens the overlay", gKeyName.c_str());
+    if (ImGui::Begin("##hint", nullptr, flags)) {
+        if (gCrashPrompt)
+            ImGui::TextColored(kYellow, "Shrouded Engine Tweaks: The last session closed unexpectedly. %s opens the "
+                                        "overlay to copy its log for a bug report.", gKeyName.c_str());
+        else ImGui::Text("Shrouded Engine Tweaks: %s opens the overlay", gKeyName.c_str());
+    }
     ImGui::End();
+}
+
+void copyLog(bool prev) {
+    gReportMsg = rep::copyText(rep::logText(ov::gameDir, prev))
+                     ? LV_OK "Copied to the clipboard: Paste it into the bug report."
+                     : LV_BAD "Copying failed. The file is shrouded_engine_tweaks\\set.log (set.prev.log for the last session).";
+}
+
+// In the browser. Its own thread: the shell can take a while, and it wants COM.
+void openPage(const wchar_t* url) {
+    std::thread([url] {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
+        if (SUCCEEDED(co)) CoUninitialize();
+    }).detach();
+}
+
+// Settings > Bug Report: both copy buttons and the two places to report.
+void drawReportButtons() {
+    if (ImGui::Button("Copy to Clipboard")) copyLog(false);
+    ImGui::SameLine();
+    if (ImGui::Button("Copy last session's logs")) copyLog(true);
+    if (ImGui::Button("Report on GitHub")) openPage(kGitHubBugs);
+    ImGui::SameLine();
+    if (ImGui::Button("Report on Nexus")) openPage(kNexusBugs);
+    drawMsg(gReportMsg);
+}
+
+// After a session that didn't close normally: what the game's crash report says, and its log one click from the
+// clipboard.
+void drawLastSession() {
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    auto flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::Begin("Last Session", &gCrashPrompt, flags)) {
+        const std::string& r = rep::lastSession().report;
+        ImGui::PushTextWrapPos(480 * gScale);
+        ImGui::TextUnformatted("The last session didn't close normally (a crash, unexpectedly, or from the outside).");
+        ImGui::TextColored(kYellow, "%s", r.empty() ? "No game crash report was written." : r.c_str());
+        ImGui::TextUnformatted("\"Copy to Clipboard\" copies that session's log (set.prev.log) to your clipboard, use "
+                               "it when reporting bugs. Your Windows user folder in it shows as %USERPROFILE%.");
+        if (gCrashOnly)
+            ImGui::TextDisabled("Dismiss goes back to the game. Settings > Bug Report in the overlay (%s) copies it later too.",
+                                gKeyName.c_str());
+        ImGui::PopTextWrapPos();
+        if (ImGui::Button("Copy to Clipboard")) copyLog(true);
+        ImGui::SameLine();
+        if (ImGui::Button("Dismiss")) gCrashPrompt = false;
+        // The report pair on the right edge of the same row.
+        const ImGuiStyle& st = ImGui::GetStyle();
+        float right = ImGui::CalcTextSize("Report on GitHub").x + ImGui::CalcTextSize("Report on Nexus").x +
+                      4 * st.FramePadding.x + st.ItemSpacing.x;
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, ImGui::GetContentRegionAvail().x - right));
+        if (ImGui::Button("Report on GitHub")) openPage(kGitHubBugs);
+        ImGui::SameLine();
+        if (ImGui::Button("Report on Nexus")) openPage(kNexusBugs);
+        drawMsg(gReportMsg);
+    }
+    ImGui::End();
+    if (!gCrashPrompt && gCrashOnly) {  // dismissed (button or X): the overlay it opened closes with it
+        gCrashOnly = false;
+        gOpen = false;
+        rt::setOverlayOpen(false);
+        ov::log(LV_LOG "Overlay: Closed");  // Open/close line
+    }
 }
 
 void drawBindRow(const rt::BindInfo& b) {
@@ -501,9 +623,12 @@ void drawBindRow(const rt::BindInfo& b) {
     ImGui::TableNextColumn();
     ImGui::PushID(b.key.c_str());
     bool capturing = gCapture == b.key;
-    std::string text = capturing ? "waiting for a key..." : b.combo.empty() ? "unbound" : b.combo;
+    // The stored combo ends in the key's stored name; it shows the layout's label instead (Ctrl+Semicolon -> Ctrl+Ü).
+    std::string shown = b.combo.substr(0, b.combo.size() - std::min(b.combo.size(), rt::keyName(b.vk).size())) + keyLabel(b.vk);
+    std::string text = capturing ? "Waiting for a key..." : b.combo.empty() ? "Unbound" : shown;
     float x = ImGui::GetFrameHeight();
-    if (ImGui::Button((text + "###bind").c_str(), ImVec2(-(x + ImGui::GetStyle().ItemSpacing.x), 0)) && !capturing)
+    // The space: ImGui hides a label from its first "##", so a key labeled # (+ "###bind") would show nothing.
+    if (ImGui::Button((text + " ###bind").c_str(), ImVec2(-(x + ImGui::GetStyle().ItemSpacing.x), 0)) && !capturing)
         startCapture(b.key);
     ImGui::SameLine();
     ImGui::BeginDisabled(b.combo.empty());
@@ -543,6 +668,61 @@ void drawBindings() {
     ImGui::End();
 }
 
+// One setting's widget. An edit goes to the store at once: the mod gets onChange at its next tick, and the file is
+// saved within a second. The key shows as the tooltip, for the mod's author.
+void drawSetting(const std::string& mod, mset::Field& f) {
+    constexpr double kExact = 9007199254740992.0;  // an int setting without min or max reaches 2^53
+    ImGui::PushID(f.key.c_str());
+    const char* label = f.label.c_str();
+    bool changed = false;
+    if (f.type == mset::Bool) {
+        bool v = f.num != 0;
+        changed = ImGui::Checkbox(label, &v);
+        f.num = v;
+    } else if (f.type == mset::Number) {
+        changed = std::isfinite(f.lo) && std::isfinite(f.hi)
+                      ? ImGui::SliderScalar(label, ImGuiDataType_Double, &f.num, &f.lo, &f.hi, "%.3g")
+                      : ImGui::InputDouble(label, &f.num, 0, 0, "%.6g");
+    } else if (f.type == mset::Int) {
+        long long v = static_cast<long long>(f.num), lo = static_cast<long long>(f.lo), hi = static_cast<long long>(f.hi);
+        long long step = 1;
+        changed = f.lo > -kExact && f.hi < kExact ? ImGui::SliderScalar(label, ImGuiDataType_S64, &v, &lo, &hi)
+                                                  : ImGui::InputScalar(label, ImGuiDataType_S64, &v, &step);
+        f.num = static_cast<double>(v);
+    } else if (f.type == mset::Choice) {
+        size_t at = static_cast<size_t>(f.num);
+        if (ImGui::BeginCombo(label, f.values[at].c_str())) {
+            for (size_t i = 0; i < f.values.size(); i++)
+                if (ImGui::Selectable(f.values[i].c_str(), i == at)) f.num = static_cast<double>(i), changed = true;
+            ImGui::EndCombo();
+        }
+    } else {
+        std::vector<char> buf(f.maxLen + 1);
+        memcpy(buf.data(), f.text.data(), std::min(f.text.size(), f.maxLen));
+        changed = ImGui::InputText(label, buf.data(), buf.size());
+        f.text = buf.data();
+    }
+    ImGui::SetItemTooltip("%s", f.key.c_str());
+    if (changed) mset::set(mod, f.key, f.num, f.text, true);
+    ImGui::PopID();
+}
+
+// The mods' Settings.define pages, one collapsible section per mod.
+void drawModSettings() {
+    ImGui::SetNextWindowSize(ImVec2(440 * gScale, 420 * gScale), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Mod Settings", &gShow[WinModSet])) {
+        std::vector<mset::Page> pages = mset::pages();
+        if (pages.empty()) ImGui::TextWrapped("No mod has settings (Settings.define).");
+        for (mset::Page& p : pages) {
+            ImGui::PushID(p.mod.c_str());
+            if (ImGui::CollapsingHeader(p.mod.c_str(), ImGuiTreeNodeFlags_DefaultOpen))
+                for (mset::Field& f : p.fields) drawSetting(p.mod, f);
+            ImGui::PopID();
+        }
+    }
+    ImGui::End();
+}
+
 void setEdit(const ov::Settings& s) {
     gEdit = s;
     strncpy_s(gKeyBuf, s.keyName.c_str(), _TRUNCATE);
@@ -551,54 +731,73 @@ void setEdit(const ov::Settings& s) {
 // Every game option as "machine.graphics.vsync = false" lines, to the console and set.log. Hosting passwords and
 // banned accounts are never in it (opts::dump).
 void dumpOptions() {
-    if (!opts::ready()) return ov::log(LV_WARN "Game options: not found yet, see set.log");
+    if (!opts::ready()) return ov::log(LV_WARN "Game Options: Not found yet, see set.log");
     size_t n = opts::dump("", [](const std::string& s) { ov::log("%s", s.c_str()); });
-    ov::log(LV_OK "Game options: %zu values", n);
+    ov::log(LV_OK "Game Options: %zu values", n);
 }
 
 // Load re-reads settings.ini, Save writes it, Default only resets the fields. The key, the frame rate cap,
 // antialiasing and the console history apply on Save. A cap under 10 isn't saved: the overlay itself would run that
 // slow.
+// Mod Settings and Compatibility open from here, right-aligned on the Dump Game Options row, lit while open.
+void drawSettingsWindows() {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    float right = ImGui::CalcTextSize("Mod Settings").x + ImGui::CalcTextSize("Compatibility").x +
+                  4 * st.FramePadding.x + st.ItemSpacing.x;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, ImGui::GetContentRegionAvail().x - right));
+    for (Win w : {WinModSet, WinCompat}) {
+        if (w == WinCompat) ImGui::SameLine();
+        bool on = gShow[w];
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        if (ImGui::Button(kWinNames[w])) gShow[w] = !on;
+        if (on) ImGui::PopStyleColor();
+    }
+}
+
 void drawSettingsBody() {
     static const char* const kAsync[] = {"Game Default", "On", "Off"};
-    ImGui::Checkbox("Separate Console Window (applies at the next start)", &gEdit.console);
+    ImGui::Checkbox("Separate Console Window (Applies on Restart)", &gEdit.console);
     if (ImGui::InputText("Overlay Key", gKeyBuf, sizeof gKeyBuf)) gEdit.keyName = gKeyBuf;
     int vk = rt::keyFromName(gKeyBuf);
-    if (!vk) ImGui::TextColored(kRed, "Unknown key: use `, F1-F24, Insert, Home, End, Delete, PageUp, PageDown, Pause or 0xNN");
-    ImGui::InputInt("Frame Rate Cap (0 = off)", &gEdit.fpsCap);
+    if (!vk) ImGui::TextColored(kRed, "Unknown key: Use `, F1-F24, Insert, Home, End, Delete, PageUp, PageDown, Pause or 0xNN");
+    ImGui::InputInt("FPS Cap (0 = Off)", &gEdit.fpsCap);
     bool capOk = gEdit.fpsCap == 0 || gEdit.fpsCap >= 10;
-    if (!capOk) ImGui::TextColored(kRed, "Frame rate cap: 0 (off), or 10 and up");
-    ImGui::Combo("Async Compute (applies at the next start)", &gEdit.asyncCompute, kAsync, IM_ARRAYSIZE(kAsync));
+    if (!capOk) ImGui::TextColored(kRed, "FPS Cap: 0 (Off), or 10 and up");
+    ImGui::Combo("Async Compute (Applies on Restart)", &gEdit.asyncCompute, kAsync, IM_ARRAYSIZE(kAsync));
     ImGui::Checkbox("Antialiasing Off (the game's menu has no off)", &gEdit.aaOff);
-    if (ImGui::InputInt("Console History (lines)", &gEdit.historyLimit))
+    if (ImGui::InputInt("Console History", &gEdit.historyLimit))
         gEdit.historyLimit = std::clamp(gEdit.historyLimit, 1, 10000);
-    ImGui::Checkbox("Keep Console History Across Game Starts", &gEdit.saveHistory);
+    ImGui::Checkbox("Keep Console History", &gEdit.saveHistory);
+    ImGui::Checkbox("Debug Logs (set.log For Bug Reports)", &gEdit.debugLog);  // DebugLog
     if (ImGui::Button("Load")) {
         setEdit(ov::readSettings());
-        gSettingsMsg = LV_OK "loaded";
+        gSettingsMsg = LV_OK "Loaded";
     }
     ImGui::SameLine();
     ImGui::BeginDisabled(!vk || !capOk);
     if (ImGui::Button("Save")) {
         bool ok = ov::saveSettings(gEdit);
         if (ok) {
-            ov::setToggleKey(vk, gEdit.keyName);
+            ov::setToggleKey(vk);
             ov::setFpsCap(gEdit.fpsCap);
             opts::setAaOff(gEdit.aaOff);
             ov::setHistory(gEdit.historyLimit, gEdit.saveHistory);
+            ov::setDebugLog(gEdit.debugLog);  // DebugLog
             saveHistory();
         }
-        gSettingsMsg = ok ? LV_OK "saved" : LV_BAD "saving settings.ini failed";
+        gSettingsMsg = ok ? LV_OK "Saved" : LV_BAD "Saving settings.ini failed";
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Default")) {
         setEdit(ov::Settings{});
-        gSettingsMsg = LV_WARN "defaults set: Save to keep them";
+        gSettingsMsg = LV_WARN "Defaults set: Save to keep them";
     }
     drawMsg(gSettingsMsg);
     ImGui::Separator();
     if (ImGui::Button("Dump Game Options")) dumpOptions();
+    drawSettingsWindows();
 }
 
 // What the runtime found as the game started: the first thing to check, and to send, when something doesn't work.
@@ -627,6 +826,9 @@ void drawSettings() {
         if (ov::gameDir.empty()) ImGui::TextUnformatted("settings.ini is only available in the game.");
         else drawSettingsBody();
         drawStatus();
+        ImGui::SeparatorText("Bug Report");
+        ImGui::TextUnformatted("Copy a log to the clipboard. Use when reporting bugs.");
+        drawReportButtons();
     }
     ImGui::End();
 }
@@ -647,7 +849,7 @@ const char* saveStyle() {
     if (ov::gameDir.empty()) return LV_WARN "style.dat is only available in the game";
     StyleFile f{IMGUI_VERSION_NUM, sizeof(ImGuiStyle), gScale, ImGui::GetStyle()};
     HANDLE h = CreateFileW(stylePath().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return LV_BAD "saving style.dat failed";
+    if (h == INVALID_HANDLE_VALUE) return LV_BAD "Saving style.dat failed";
     DWORD w = 0;
     bool ok = WriteFile(h, &f, sizeof f, &w, nullptr) && w == sizeof f;
     CloseHandle(h);
@@ -657,20 +859,20 @@ const char* saveStyle() {
 const char* loadStyle() {
     if (ov::gameDir.empty()) return LV_WARN "style.dat is only available in the game";
     HANDLE h = CreateFileW(stylePath().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return LV_WARN "no saved style";
+    if (h == INVALID_HANDLE_VALUE) return LV_WARN "No saved style";
     StyleFile f;
     DWORD got = 0;
     bool ok = ReadFile(h, &f, sizeof f, &got, nullptr) && got == sizeof f;
     CloseHandle(h);
     if (!ok || f.version != IMGUI_VERSION_NUM || f.size != sizeof(ImGuiStyle) || !(f.scale > 0))
-        return LV_WARN "style.dat is from another runtime build: not loaded";
+        return LV_WARN "style.dat is from another runtime build: Not loaded";
     ImGuiStyle& style = ImGui::GetStyle();
     style = f.style;
     if (f.scale != gScale) {
         style.ScaleAllSizes(gScale / f.scale);
         style.FontScaleMain *= gScale / f.scale;
     }
-    return LV_OK "style loaded";
+    return LV_OK "Style loaded";
 }
 
 void defaultStyle() {
@@ -823,7 +1025,7 @@ void selectRes(const res::Entry* e) {
 // The type picker: a search box above the list, which keeps the types whose name holds every word typed. The list is a
 // child of its own so the box stays in view while it scrolls.
 void drawTypePicker() {
-    std::string preview = gRv.type < 0 ? "pick a type" : std::string(gRv.types[size_t(gRv.type)].first.qname());
+    std::string preview = gRv.type < 0 ? "Pick a Type" : std::string(gRv.types[size_t(gRv.type)].first.qname());
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (!ImGui::BeginCombo("##type", preview.c_str(), ImGuiComboFlags_HeightLargest)) return;
     if (ImGui::IsWindowAppearing()) {
@@ -831,7 +1033,7 @@ void drawTypePicker() {
         ImGui::SetKeyboardFocusHere();
     }
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::InputTextWithHint("##typefind", "search types", gRv.typeFind, sizeof gRv.typeFind);
+    ImGui::InputTextWithHint("##typefind", "Search Types", gRv.typeFind, sizeof gRv.typeFind);
     std::string f = lowerStr(gRv.typeFind);
     ImGui::BeginChild("types", ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 20));
     for (size_t i = 0; i < gRv.types.size(); i++) {
@@ -861,9 +1063,9 @@ void drawGroupPicker() {
     if (gRv.fields.empty()) return;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-FLT_MIN);
-    const char* preview = gRv.field < 0 ? "no groups" : gRv.fields[size_t(gRv.field)].path.c_str();
+    const char* preview = gRv.field < 0 ? "No groups" : gRv.fields[size_t(gRv.field)].path.c_str();
     if (!ImGui::BeginCombo("##group", preview)) return;
-    if (ImGui::Selectable("no groups", gRv.field < 0)) gRv.field = -1;
+    if (ImGui::Selectable("No groups", gRv.field < 0)) gRv.field = -1;
     for (size_t i = 0; i < gRv.fields.size(); i++)
         if (ImGui::Selectable(gRv.fields[i].path.c_str(), gRv.field == int(i))) gRv.field = int(i);
     ImGui::EndCombo();
@@ -909,7 +1111,7 @@ void drawResList() {
     if (gRv.types.empty()) gRv.types = res::types();
     drawTypePicker();
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::InputTextWithHint("##filter", "filter: name or GUID", gRv.filter, sizeof gRv.filter);
+    ImGui::InputTextWithHint("##filter", "Filter: Name or GUID.", gRv.filter, sizeof gRv.filter);
     if (gRv.type < 0) return;
     pickFields();
     buildRows();
@@ -957,40 +1159,83 @@ void resWrite(uint8_t* p, const void* v, size_t n) {
     res::write(p, v, n, prot);
 }
 
-void editEnum(uint8_t* p, refl::Type u) {
+// Where a field tree's values come from: a resource, read and edited in place, or the inspector's copy of an
+// entity's component, whose edits become requests the next tick checks (insp::edit).
+struct Src {
+    uint8_t* base;
+    uint64_t size;
+    const res::Entry* res;  // null for a component copy
+    uint32_t entity, comp;  // the component copy's entity and type hash
+    uint64_t serial;        // the selection the copy belongs to
+};
+
+// A field's ImGui id. A component copy is replaced at every refresh, so its widgets go by offset, not address: an
+// address would change under a field being typed into and drop the edit.
+void pushFieldId(const Src& s, const uint8_t* p) {
+    if (s.res) ImGui::PushID(p);
+    else ImGui::PushID(int(p - s.base));
+}
+
+bool inside(const Src& s, const uint8_t* p, uint64_t n) {
+    if (s.res) return res::inside(*s.res, p, n);
+    return p >= s.base && n <= s.size && uint64_t(p - s.base) <= s.size - n;
+}
+
+void writeValue(const Src& s, uint8_t* p, refl::Type u, const void* v, const std::string& path) {
+    if (s.res) return resWrite(p, v, std::min<uint32_t>(u.size(), 8));
+    insp::edit(s.serial, s.comp, uint32_t(p - s.base), u, p, v, path);
+}
+
+void editEnum(const Src& s, uint8_t* p, refl::Type u, const std::string& path) {
     uint64_t v = 0;
     uint32_t n = std::min<uint32_t>(u.size(), 8);
     memcpy(&v, p, n);
     if (!ImGui::BeginCombo("##v", refl::text(p, u).c_str())) return;
     refl::forEnum(u, [&](std::string_view name, int64_t e) {
         std::string item = std::string(name) + " (" + std::to_string(e) + ")";
-        if (ImGui::Selectable(item.c_str(), uint64_t(e) == v)) resWrite(p, &e, n);
+        if (ImGui::Selectable(item.c_str(), uint64_t(e) == v)) writeValue(s, p, u, &e, path);
     });
     ImGui::EndCombo();
 }
 
-// Edits a scalar in place, in the game's memory: bools as a checkbox, enums as a list of their values, numbers on
-// Enter. The field reads the game every frame, so it always shows what the game has.
-void editScalar(uint8_t* p, refl::Type u) {
+// Edits a scalar: bools as a checkbox, enums as a list of their values, numbers on Enter. A resource field reads the
+// game every frame; a component field shows the inspector's latest copy.
+void editScalar(const Src& s, uint8_t* p, refl::Type u, const std::string& path) {
     uint8_t k = u.prim();
-    ImGui::PushID(p);
+    pushFieldId(s, p);
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (k == refl::Bool) {
         bool b = *p != 0;
         if (ImGui::Checkbox("##v", &b)) {
             uint8_t v = b ? 1 : 0;
-            resWrite(p, &v, 1);
+            writeValue(s, p, u, &v, path);
         }
     } else if (k == refl::Enum && u.fieldCount()) {
-        editEnum(p, u);
+        editEnum(s, p, u, path);
     } else {
         bool mask = k >= refl::Bitmask8 && k <= refl::Bitmask64;
         const char* fmt = k == refl::F32 || k == refl::F64 ? "%g" : !mask ? nullptr : u.size() == 8 ? "%llX" : "%X";
         ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue | (mask ? ImGuiInputTextFlags_CharsHexadecimal : 0);
         uint64_t v = 0;
         memcpy(&v, p, u.size());
-        if (ImGui::InputScalar("##v", dataType(u), &v, nullptr, nullptr, fmt, flags)) resWrite(p, &v, u.size());
+        if (ImGui::InputScalar("##v", dataType(u), &v, nullptr, nullptr, fmt, flags)) writeValue(s, p, u, &v, path);
     }
+    if (!s.res && ImGui::BeginPopupContextItem("watch")) {  // right-click: into the watchlist
+        if (ImGui::MenuItem("Watch this value")) insp::pin(s.entity, s.comp, uint32_t(p - s.base), u, path);
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+}
+
+// An EntityId field of a component: the id, and a button that selects that entity.
+void drawEntityLink(const Src& s, const uint8_t* p) {
+    uint32_t id = 0;
+    memcpy(&id, p, 4);
+    if (!id) return ImGui::TextDisabled("None");
+    ImGui::Text("%u", id);
+    ImGui::SameLine();
+    pushFieldId(s, p);
+    if (ImGui::SmallButton("Select")) insp::select(id);
     ImGui::PopID();
 }
 
@@ -998,23 +1243,23 @@ void drawString(const res::Entry& e, const uint8_t* p) {
     res::Blob b = res::blob(p, refl::BlobString);
     const uint8_t* s = p + b.rel;
     if (!b.count) ImGui::TextDisabled("\"\"");
-    else if (!res::inside(e, s, b.count)) ImGui::TextDisabled("<outside the resource>");
+    else if (!res::inside(e, s, b.count)) ImGui::TextDisabled("<Outside the resource>");
     else ImGui::Text("\"%.*s\"", int(b.count), reinterpret_cast<const char*>(s));
 }
 
 // A GUID, then its English text for a LocaTag reference, or Go when it names a resource: of the reference's own type
 // first, then of any type (a TemplateReference names a TemplateResource).
-void drawRef(const uint8_t* p, refl::Type u) {
+void drawRef(const Src& s, const uint8_t* p, refl::Type u) {
     static constexpr uint8_t kNone[16] = {};
     if (memcmp(p, kNone, 16) == 0) {
-        ImGui::TextDisabled("none");
+        ImGui::TextDisabled("None");
         return;
     }
     ImGui::TextUnformatted(res::guidStr(p).c_str());
     if (res::isText(u)) {
         std::string_view t = res::text(p);
         ImGui::SameLine();
-        if (t.empty()) ImGui::TextDisabled("(no English text)");
+        if (t.empty()) ImGui::TextDisabled("(No English text)");
         else ImGui::Text("\"%.*s\"", int(t.size()), t.data());
         return;
     }
@@ -1022,39 +1267,46 @@ void drawRef(const uint8_t* p, refl::Type u) {
     if (!to) to = res::find(p, 0);
     if (!to) return;
     ImGui::SameLine();
-    ImGui::PushID(p);
+    pushFieldId(s, p);
     if (ImGui::SmallButton("Go")) selectRes(to);
     ImGui::PopID();
 }
 
-void drawValue(const res::Entry& e, const std::string& name, uint64_t off, refl::Type t, int depth);
+void drawValue(const Src& s, const std::string& name, const std::string& path, uint64_t off, refl::Type t, int depth);
 
-void drawStruct(const res::Entry& e, const std::string& name, uint64_t off, refl::Type u, int depth) {
+void drawStruct(const Src& s, const std::string& name, const std::string& path, uint64_t off, refl::Type u, int depth) {
     bool open = nameCell(name, true);
     ImGui::TextDisabled("%.*s", int(u.name().size()), u.name().data());
     if (!open) return;
-    refl::forFields(u, [&](const refl::Field& f) { drawValue(e, std::string(f.name), off + f.offset, f.type, depth + 1); });
+    refl::forFields(u, [&](const refl::Field& f) {
+        std::string n(f.name);
+        drawValue(s, n, path.empty() ? n : path + "." + n, off + f.offset, f.type, depth + 1);
+    });
     ImGui::TreePop();
 }
 
-// Limit: shows the first 500 elements; paging if someone needs the rest of a big registry.
-void drawArray(const res::Entry& e, const std::string& name, uint64_t off, refl::Type u, int depth) {
+// Limit: shows the first 500 elements; paging if someone needs the rest of a big registry. Blob arrays live in
+// resources only; a component copy shows its static arrays.
+void drawArray(const Src& s, const std::string& name, const std::string& path, uint64_t off, refl::Type u, int depth) {
     refl::Type el = u.inner();
     uint64_t size = el ? el.size() : 0, start = off, n = size ? u.size() / size : 0;
     if (u.prim() == refl::BlobArray) {
-        res::Blob b = res::blob(res::data(e) + off, refl::BlobArray);
+        res::Blob b = res::blob(s.base + off, refl::BlobArray);
         start = off + b.rel;
         n = b.count;
     }
-    bool ok = !n || (start <= e.size && res::inside(e, res::data(e) + start, n * size));
+    bool ok = !n || (start <= s.size && inside(s, s.base + start, n * size));
     bool open = nameCell(name, n && ok);
     if (!ok) {
-        ImGui::TextDisabled("<outside the resource>");
+        ImGui::TextDisabled(s.res ? "<Outside the resource>" : "<Outside the component>");
         return;
     }
     ImGui::TextDisabled("%llu x %.*s", n, int(el.name().size()), el.name().data());
     if (!open) return;
-    for (uint64_t i = 0; i < n && i < 500; i++) drawValue(e, "[" + std::to_string(i) + "]", start + i * size, el, depth + 1);
+    for (uint64_t i = 0; i < n && i < 500; i++) {
+        std::string at = "[" + std::to_string(i) + "]";
+        drawValue(s, at, path + at, start + i * size, el, depth + 1);
+    }
     if (n > 500) {
         nameCell("...", false);
         ImGui::TextDisabled("%llu more", n - 500);
@@ -1062,30 +1314,33 @@ void drawArray(const res::Entry& e, const std::string& name, uint64_t off, refl:
     ImGui::TreePop();
 }
 
-// One field or element of the selected resource, read in place and bounds-checked against the resource.
-void drawValue(const res::Entry& e, const std::string& name, uint64_t off, refl::Type t, int depth) {
+bool isEntityId(refl::Type t) { return t.prim() == refl::Struct && t.qname().ends_with("ecs::EntityId"); }
+
+// One field or element, read from the source and bounds-checked against it. Blob values exist in resources only.
+void drawValue(const Src& s, const std::string& name, const std::string& path, uint64_t off, refl::Type t, int depth) {
     refl::Type u = refl::unwrap(t.resolved());
     uint8_t k = u.prim();
-    uint8_t* p = res::data(e) + off;
-    if (depth > 32 || off > e.size || !res::inside(e, p, u.size())) {
+    uint8_t* p = s.base + off;
+    if (depth > 32 || off > s.size || !inside(s, p, u.size())) {
         nameCell(name, false);
-        ImGui::TextDisabled("<outside the resource>");
+        ImGui::TextDisabled(s.res ? "<Outside the resource>" : "<Outside the component>");
         return;
     }
-    if (k == refl::Struct) return drawStruct(e, name, off, u, depth);
-    if (k == refl::StaticArray || k == refl::BlobArray) return drawArray(e, name, off, u, depth);
-    if (k == refl::BlobOptional || k == refl::BlobVariant) {
+    if (k == refl::Struct) return drawStruct(s, name, path, off, u, depth);
+    if (k == refl::StaticArray || (k == refl::BlobArray && s.res)) return drawArray(s, name, path, off, u, depth);
+    if ((k == refl::BlobOptional || k == refl::BlobVariant) && s.res) {
         res::Blob b = res::blob(p, k);
         refl::Type v = k == refl::BlobVariant ? refl::byHash(b.hash) : u.inner();
-        if (b.count && v) return drawValue(e, name, off + b.rel, v, depth + 1);
+        if (b.count && v) return drawValue(s, name, path, off + b.rel, v, depth + 1);
         nameCell(name, false);
-        ImGui::TextDisabled("none");
+        ImGui::TextDisabled("None");
         return;
     }
     nameCell(name, false);
-    if (k == refl::BlobString) drawString(e, p);
-    else if ((k == refl::ObjectReference || k == refl::Guid) && u.size() == 16) drawRef(p, u);
-    else if (k >= refl::Bool && k <= refl::Bitmask64 && u.size() <= 8) editScalar(p, u);
+    if (k == refl::BlobString && s.res) drawString(*s.res, p);
+    else if (!s.res && isEntityId(t.resolved())) drawEntityLink(s, p);
+    else if ((k == refl::ObjectReference || k == refl::Guid) && u.size() == 16) drawRef(s, p, u);
+    else if (k >= refl::Bool && k <= refl::Bitmask64 && u.size() <= 8) editScalar(s, p, u, path);
     else {
         ImGui::TextDisabled("<%.*s>", int(u.qname().size()), u.qname().data());
     }
@@ -1102,7 +1357,8 @@ void drawResFields(const res::Entry& e) {
     else ImGui::TextDisabled("%u bytes", e.size);
     if (!ImGui::BeginTable("fields", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY))
         return;
-    refl::forFields(t, [&](const refl::Field& f) { drawValue(e, std::string(f.name), f.offset, f.type, 0); });
+    Src s{res::data(e), e.size, &e, 0, 0, 0};
+    refl::forFields(t, [&](const refl::Field& f) { drawValue(s, std::string(f.name), std::string(f.name), f.offset, f.type, 0); });
     ImGui::EndTable();
 }
 
@@ -1121,6 +1377,157 @@ void drawResources() {
             ImGui::BeginChild("detail", ImVec2(0, 0), ImGuiChildFlags_Borders);
             if (gRv.sel) drawResFields(*gRv.sel);
             else ImGui::TextDisabled("Pick a type, then a resource on the left.");
+            ImGui::EndChild();
+        }
+    }
+    ImGui::End();
+}
+
+// ---- Entities: the inspector's copies (insp::view), never the game's memory ----
+
+char gEntFilter[64];
+uint32_t gEntSearch;
+
+void drawEntFilter() {
+    ImGui::SetNextItemWidth(150 * gScale);
+    bool go = ImGui::InputTextWithHint("##comp", "Component", gEntFilter, sizeof gEntFilter, ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SetItemTooltip("Only entities with this component, like Health. Empty for all.");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110 * gScale);
+    go |= ImGui::InputScalar("##id", ImGuiDataType_U32, &gEntSearch, nullptr, nullptr, "%u", ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SetItemTooltip("An entity id to look up; 0 for the nearest ones.");
+    ImGui::SameLine();
+    if (ImGui::Button("Show") || go) insp::setFilter(gEntFilter, gEntSearch);
+}
+
+void drawEntRow(const insp::View& v, const insp::Row& r) {
+    static const refl::Type faction = [] {
+        refl::Field f;
+        return refl::field(refl::byName("Faction"), "faction", f) ? f.type.resolved() : refl::Type{};
+    }();
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    char id[16];
+    snprintf(id, sizeof id, "%u", r.id);
+    if (ImGui::Selectable(id, v.sel == r.id && !v.selGone, ImGuiSelectableFlags_SpanAllColumns)) insp::select(r.id);
+    ImGui::TableNextColumn();
+    if (r.dist >= 0) ImGui::Text("%.1f m", r.dist);
+    else ImGui::TextDisabled("-");
+    ImGui::TableNextColumn();
+    if (r.hasHp) ImGui::Text("%d", r.hp);
+    else ImGui::TextDisabled("-");
+    ImGui::TableNextColumn();
+    uint8_t f = uint8_t(r.faction);
+    if (r.faction >= 0 && faction) ImGui::TextUnformatted(refl::text(&f, faction).c_str());
+    else ImGui::TextDisabled("-");
+    ImGui::TableNextColumn();
+    ImGui::Text("%u", r.comps);
+}
+
+void drawEntList(const insp::View& v) {
+    drawEntFilter();
+    ImGui::TextDisabled("Showing %zu/%u, Nearest first.", v.rows.size(), v.matched);
+    if (!ImGui::BeginTable("ents", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    for (const char* c : {"Id", "Distance", "HP", "Faction", "Comps"}) ImGui::TableSetupColumn(c);
+    ImGui::TableHeadersRow();
+    ImGuiListClipper clip;
+    clip.Begin(static_cast<int>(v.rows.size()));
+    while (clip.Step())
+        for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) drawEntRow(v, v.rows[size_t(i)]);
+    ImGui::EndTable();
+}
+
+// A component of the selected entity: its fields once expanded and copied. Expanding tells the inspector to copy it.
+void drawEntComp(const insp::View& v, const insp::Comp& c) {
+    char unknown[32];
+    snprintf(unknown, sizeof unknown, "type %08x", c.hash);
+    std::string name = c.type ? std::string(c.type.name()) : unknown;
+    ImGui::PushID(int(c.hash));
+    bool open = nameCell(name, bool(c.type));
+    if (c.type) ImGui::TextDisabled("%u bytes%s", c.type.size(), c.truncated ? ", not refreshed: Over this refresh's budget" : "");
+    else ImGui::TextDisabled("Not in the reflection table");
+    if (c.type && open != c.open) insp::expand(c.hash, open);
+    if (open) {
+        if (c.data.empty()) {
+            nameCell("...", false);
+            ImGui::TextDisabled("Copied at the next refresh");
+        } else {
+            Src s{const_cast<uint8_t*>(c.data.data()), c.data.size(), nullptr, v.sel, c.hash, v.selSerial};
+            refl::forFields(c.type, [&](const refl::Field& f) {
+                std::string n(f.name);
+                drawValue(s, n, name + "." + n, f.offset, f.type, 1);
+            });
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
+void drawEntDetail(const insp::View& v, float reserve) {
+    if (!v.sel) return ImGui::TextDisabled("Pick an entity on the left.");
+    if (v.selGone) {
+        ImGui::TextColored(kYellow, "Entity %u is gone", v.sel);
+        ImGui::TextWrapped("It left the world, or another world started. If something came back under this id, it's "
+                           "a new object: Pick it again in the list.");
+        return;
+    }
+    ImGui::Text("Entity %u", v.sel);
+    ImGui::TextDisabled("Edits apply at the next game tick, only if the value is still what you see here.");
+    ImGui::TextDisabled("Right-click a value to watch it. (?)");
+    ImGui::SetItemTooltip("An entity the game removes and re-creates under the same id within one game tick can't be "
+                          "told apart from the old one.");
+    if (!v.note.empty()) ImGui::TextWrapped("%s", v.note.c_str());
+    ImGuiTableFlags flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY;
+    if (!ImGui::BeginTable("comps", 2, flags, ImVec2(0, -reserve))) return;
+    for (const insp::Comp& c : v.comps) drawEntComp(v, c);
+    ImGui::EndTable();
+}
+
+void drawWatchlist(const insp::View& v) {
+    ImGui::SeparatorText("Watchlist");
+    if (!ImGui::BeginTable("pins", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) return;
+    for (const insp::Pin& p : v.pins) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(p.label.c_str());
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", p.id);
+        ImGui::TableNextColumn();
+        if (p.gone) ImGui::TextColored(kYellow, "Gone");
+        else if (!p.have || !p.leaf) ImGui::TextDisabled("No such component now");
+        else ImGui::TextUnformatted(refl::text(p.value, p.leaf).c_str());
+        ImGui::TableNextColumn();
+        ImGui::PushID(int(p.id));  // by the pin, not its address: the view is replaced at every refresh
+        ImGui::PushID(int(p.comp));
+        ImGui::PushID(int(p.off));
+        if (ImGui::SmallButton("x")) insp::unpin(p.id, p.comp, p.off);
+        ImGui::PopID();
+        ImGui::PopID();
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+}
+
+void drawEntities() {
+    ImGui::SetNextWindowPos(ImVec2(440 * gScale, 140 * gScale), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(1000 * gScale, 700 * gScale), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Entities", &gShow[WinEnt])) {
+        std::shared_ptr<const insp::View> v = insp::view();
+        if (v->off) {
+            ImGui::TextWrapped("The inspector hit an access violation and is off until the game restarts. set.log has "
+                               "the line.");
+        } else if (!v->inWorld) {
+            ImGui::TextWrapped("The inspector reads a world you host. Load one, and the list fills in within a second.");
+        } else {
+            ImGui::BeginChild("list", ImVec2(400 * gScale, 0), ImGuiChildFlags_ResizeX | ImGuiChildFlags_Borders);
+            drawEntList(*v);
+            ImGui::EndChild();
+            ImGui::SameLine();
+            ImGui::BeginChild("detail", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            float line = ImGui::GetFrameHeightWithSpacing();
+            drawEntDetail(*v, v->pins.empty() ? 0 : line * float(std::min<size_t>(v->pins.size(), 8) + 2));
+            if (!v->pins.empty()) drawWatchlist(*v);
             ImGui::EndChild();
         }
     }
@@ -1168,7 +1575,7 @@ void updateRates() {
 void logTopSystems() {
     double secs = sys::profiledSecs();
     if (secs <= 0) return;
-    ov::log("Systems: top 30 by CPU ms per second, over %.0f s", secs);
+    ov::log("Systems: Top 30 by CPU ms per second, over %.0f s", secs);
     auto st = sys::stats();
     for (size_t i = 0; i < st.size() && i < 30; i++)
         ov::log("  %-48.*s %8.2f ms/s %8.0f calls/s  %s", int(st[i].sys->name.size()), st[i].sys->name.data(),
@@ -1179,7 +1586,7 @@ void logTopSystems() {
 void drawSysControls() {
     const auto& all = sys::all();
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::InputTextWithHint("##sysfilter", "filter: words in the name", gSysFilter, sizeof gSysFilter);
+    ImGui::InputTextWithHint("##sysfilter", "Filter: Words in the name.", gSysFilter, sizeof gSysFilter);
     ImGui::Checkbox("Off Only", &gSysOffOnly);
     ImGui::SameLine();
     ImGui::TextDisabled("%zu systems, %zu off", all.size(), sys::offCount());
@@ -1232,11 +1639,11 @@ void drawSystems() {
     ImGui::SetNextWindowSize(ImVec2(720 * gScale, 640 * gScale), ImGuiCond_FirstUseEver);
     bool open = ImGui::Begin("Systems", &gShow[WinSys]);
     if (open && !rt::systemsAvailable()) {
-        ImGui::TextDisabled("Systems is unavailable in this game build: see set.log.");
+        ImGui::TextDisabled("Systems is unavailable in this game build: See set.log.");
     } else if (open) {
         const auto& all = sys::all();
         ImGui::TextWrapped("Unticked, the game stops running a system in every world, until it's ticked again or the "
-                           "game closes. Some are needed: if the world breaks, tick them again or reload the world.");
+                           "game closes. Some are needed: If the world breaks, tick them again or reload the world.");
         drawSysControls();
         std::string f = lowerStr(gSysFilter);
         std::vector<const sys::System*> rows;
@@ -1275,9 +1682,10 @@ void drawReload() {
     ImGui::BeginDisabled(!loaded);
     if (ImGui::Button("Reload Mods")) ImGui::OpenPopup("reload");
     ImGui::EndDisabled();
-    if (!loaded) ImGui::SetItemTooltip("mods aren't loaded: see set.log");
+    if (!loaded) ImGui::SetItemTooltip("Mods aren't loaded: See set.log");
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopup("reload")) return;
-    ImGui::TextUnformatted("Reload every mod? Each starts again from its init.lua.");
+    ImGui::TextUnformatted("Reload all mods? Restarts via init.lua");
     if (ImGui::Button("Reload")) {
         rt::requestReload();
         ImGui::CloseCurrentPopup();
@@ -1295,6 +1703,7 @@ void drawToolbar() {
                  ImGuiWindowFlags_NoSavedSettings;
     if (ImGui::Begin("##toolbar", nullptr, flags)) {
         for (int i = 0; i < WinCount; i++) {
+            if (i == WinModSet || i == WinCompat) continue;  // opened from Settings
             if (i) ImGui::SameLine();
             bool on = gShow[i];
             if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
@@ -1306,7 +1715,7 @@ void drawToolbar() {
         if (lv::Level w = statusWorst(); w >= lv::warn) {
             ImGui::SameLine();
             ImGui::TextColored(w == lv::warn ? kYellow : kRed, "(!)");
-            ImGui::SetItemTooltip("Something wasn't found, or this game build is untested: see Settings > Status");
+            ImGui::SetItemTooltip("Something wasn't found, or this game build is untested: See Settings > Status");
         }
     }
     ImGui::End();
@@ -1328,13 +1737,13 @@ double hookRate(uintptr_t fn, uint64_t calls) {
 
 void drawHookSubs(const hk::TargetInfo& t) {
     if (!ImGui::BeginTable("subscribers", 7, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX)) return;
-    for (const char* col : {"Mod / name", "State", "Delivered", "Dropped", "Discarded", "High-water / capacity", "Lock waits"})
+    for (const char* col : {"Mod / Name", "State", "Delivered", "Dropped", "Discarded", "High-Water / Capacity", "Lock Waits"})
         ImGui::TableSetupColumn(col);
     ImGui::TableHeadersRow();
     for (const auto& s : t.subs) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::TextUnformatted(s.key.c_str());
-        ImGui::TableNextColumn(); ImGui::TextUnformatted(t.faulted ? "faulted" : s.active ? "active" : "inactive");
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(t.faulted ? "Faulted" : s.active ? "Active" : "Inactive");
         ImGui::TableNextColumn(); ImGui::Text("%llu", s.delivered);
         ImGui::TableNextColumn(); ImGui::Text("%llu", s.dropped);
         ImGui::TableNextColumn(); ImGui::Text("%llu", s.discarded);
@@ -1344,23 +1753,44 @@ void drawHookSubs(const hk::TargetInfo& t) {
     ImGui::EndTable();
 }
 
+// Rules run in the order listed. A conflict is another mod's rule changing the same value: both apply, in order.
+void drawHookRules(const hk::TargetInfo& t) {
+    if (t.rules.empty() || !ImGui::BeginTable("rules", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) return;
+    for (const char* col : {"Rule", "State", "Hits", "Refused", "Faults", "Also Changed By"}) ImGui::TableSetupColumn(col);
+    ImGui::TableHeadersRow();
+    for (const auto& r : t.rules) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(r.key.c_str());
+        ImGui::TableNextColumn();
+        if (r.faulted) ImGui::TextColored(kRed, "Faulted");
+        else ImGui::TextUnformatted(r.active ? "Active" : "Removed");
+        ImGui::TableNextColumn(); ImGui::Text("%llu", r.hits);
+        ImGui::TableNextColumn(); ImGui::Text("%llu", r.refused);
+        ImGui::TableNextColumn(); ImGui::Text("%llu", r.faults);
+        ImGui::TableNextColumn();
+        if (!r.conflict.empty()) ImGui::TextColored(kYellow, "%s", r.conflict.c_str());
+    }
+    ImGui::EndTable();
+}
+
 void drawHookTarget(const hk::TargetInfo& t) {
     ImGui::PushID(reinterpret_cast<void*>(t.fn));
     auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     ImGui::Separator();
-    ImGui::Text("exe+%llx (%p)  |  %.0f calls/s", t.fn - base, reinterpret_cast<void*>(t.fn), hookRate(t.fn, t.calls));
+    uint64_t calls = std::max(t.calls, t.ruleCalls);
+    ImGui::Text("exe+%llx (%p)  |  %.0f calls/s", t.fn - base, reinterpret_cast<void*>(t.fn), hookRate(t.fn, calls));
     bool timing = t.timing;
-    if (ImGui::Checkbox("Capture timing", &timing)) hk::setTiming(t.fn, timing);
+    if (ImGui::Checkbox("Timing", &timing)) hk::setTiming(t.fn, timing);
     ImGui::SameLine();
-    ImGui::TextDisabled("%llu observed calls; %llu metadata lock waits", t.calls, t.lockWaits);
-    if (t.timedCalls) {
-        LARGE_INTEGER freq;
-        QueryPerformanceFrequency(&freq);
-        ImGui::Text("Timed capture: %.3f us/call (%llu samples)",
-                    double(t.captureTicks) * 1e6 / double(freq.QuadPart) / double(t.timedCalls), t.timedCalls);
-    }
-    if (t.faulted) ImGui::TextColored(kRed, "Disabled after a fault. Restart the game before retrying this target.");
-    drawHookSubs(t);
+    ImGui::TextDisabled("%llu Observed, %llu Ruled calls; %llu Metadata lock waits", t.calls, t.ruleCalls, t.lockWaits);
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    auto us = [&](uint64_t ticks, uint64_t n) { return double(ticks) * 1e6 / double(freq.QuadPart) / double(n); };
+    if (t.timedCalls) ImGui::Text("Timed capture: %.3f us/call (%llu samples)", us(t.captureTicks, t.timedCalls), t.timedCalls);
+    if (t.ruleTimed) ImGui::Text("Timed rules: %.3f us/call (%llu samples)", us(t.ruleTicks, t.ruleTimed), t.ruleTimed);
+    if (t.faulted) ImGui::TextColored(kRed, "Observation disabled after a fault. Restart the game before retrying it.");
+    drawHookRules(t);
+    if (!t.subs.empty()) drawHookSubs(t);
     ImGui::PopID();
 }
 
@@ -1368,28 +1798,66 @@ void drawHooks() {
     ImGui::SetNextWindowSize(ImVec2(1000 * gScale, 540 * gScale), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Hooks", &gShow[WinHooks])) {
         auto targets = hk::info();
-        ImGui::Text("%zu / %d retained targets; %.2f / 64 MiB queue and delivery budget",
+        ImGui::Text("%zu/%d Retained targets; %.2f/64 MiB queue & delivery budget.",
                     targets.size(), hk::kMaxTargets, double(hk::retainedBytes()) / (1024 * 1024));
-        ImGui::TextWrapped("Observations reach mods on the next tick. Dropped means queue overflow; discarded means "
-                          "removed, reloaded, faulted, or invalidated by a world transition. Timing adds overhead.");
+        ImGui::TextWrapped("Rules change a call's arguments as it happens, in mod order. Observations reach mods on the "
+                           "next tick.");
+        ImGui::TextWrapped("Dropped = queue overflow; discarded = removed, reloaded, faulted or invalidated by a world "
+                           "transition. Timing adds overhead.");
         if (targets.empty()) ImGui::TextDisabled("No function hooks registered.");
         for (const auto& t : targets) drawHookTarget(t);
         auto notes = hk::diagnostics();
-        if (!notes.empty() && ImGui::CollapsingHeader("Recent refusals and faults"))
+        if (!notes.empty() && ImGui::CollapsingHeader("Recent Refusals and Faults"))
             for (const auto& line : notes) ImGui::TextWrapped("%s", line.c_str());
+    }
+    ImGui::End();
+}
+
+// What works on this game build and right now: the same rows Features() gives mods.
+void drawCompat() {
+    ImGui::SetNextWindowSize(ImVec2(760 * gScale, 420 * gScale), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Compatibility", &gShow[WinCompat])) {
+        ImGui::TextColored(kGreen, "Green = Works.");
+        ImGui::TextColored(kYellow, "Yellow = Works on this build, but not right now.");
+        ImGui::TextColored(kRed, "Red = Off on this build. Mods read the same with Features(), by ID.");
+        if (ImGui::BeginTable("features", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupColumn("Feature");
+            ImGui::TableSetupColumn("Id");
+            ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+            for (const rt::Feature& f : rt::features()) {
+                bool build = f.id == "game_build";
+                const char* state = build ? (f.compatible ? "Tested" : "Untested")
+                                          : f.available ? "Available" : f.compatible ? "Not available" : "Off";
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(f.label.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", f.id.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextColored(f.available ? kGreen : f.compatible || build ? kYellow : kRed, "%s%s%s", state,
+                                   f.reason.empty() ? "" : ": ", f.reason.c_str());
+            }
+            ImGui::EndTable();
+        }
     }
     ImGui::End();
 }
 
 void drawWindows() {
     if (gAskKey) return drawAskKey();
+    if (gCrashOnly) return drawLastSession();
     drawToolbar();
+    if (gCrashPrompt) drawLastSession();
     if (gShow[WinConsole]) drawConsole();
     if (gShow[WinBinds]) drawBindings();
+    if (gShow[WinModSet]) drawModSettings();
     if (gShow[WinRes]) drawResources();
+    if (gShow[WinEnt]) drawEntities();
     if (gShow[WinSys]) drawSystems();
     if (gShow[WinHooks]) drawHooks();
     if (gShow[WinLog]) drawGameLog();
+    if (gShow[WinCompat]) drawCompat();
     if (gShow[WinSettings]) drawSettings();
     if (gShow[WinDebug]) drawDebug();
     if (gMetrics) ImGui::ShowMetricsWindow(&gMetrics);
@@ -1398,10 +1866,12 @@ void drawWindows() {
 
 // Consolas ships with Windows; ImGui's own font is the fallback. Sizes scale with the window height (1080p = 1).
 // A saved style (style.dat) replaces the default.
+float scaleFor(float height) { return std::clamp(height / 1080.0f, 1.0f, 3.0f); }
+
 void setupStyle(HWND wnd) {
     RECT rc{};
     GetClientRect(wnd, &rc);
-    gScale = std::clamp((rc.bottom - rc.top) / 1080.0f, 1.0f, 3.0f);
+    gScale = scaleFor(static_cast<float>(rc.bottom - rc.top));
     ImGuiIO& io = ImGui::GetIO();
     if (!io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", 16.0f)) io.Fonts->AddFontDefault();
     defaultStyle();
@@ -1416,9 +1886,30 @@ extern "C" __declspec(dllexport) void rtOverlayOpenAll() {
     gMetrics = gIdStack = true;
     sys::setProfiling(true);  // the Systems window's profiler view
     gCon.finding = gLog.lines.finding = true;
+    auto field = [](const char* key, mset::Type type) {  // a page with every kind of setting, never saved (no edits)
+        mset::Field f;
+        f.key = f.label = key;
+        f.type = type;
+        return f;
+    };
+    mset::Page page{"settings test", "", {field("god", mset::Bool), field("regen", mset::Number),
+                    field("count", mset::Int), field("free", mset::Int), field("mode", mset::Choice), field("name", mset::Text)}};
+    page.fields[1].lo = 0, page.fields[1].hi = 100, page.fields[1].num = 5;
+    page.fields[2].lo = 1, page.fields[2].hi = 10, page.fields[2].num = 3;
+    page.fields[3].lo = -9007199254740992.0, page.fields[3].hi = 9007199254740992.0;
+    page.fields[4].values = {"off", "slow", "fast"}, page.fields[4].num = 1;
+    page.fields[5].text = "hello", page.fields[5].maxLen = 3;  // longer than allowed: drawn cut, not past the buffer
+    mset::define(std::move(page));
     std::string row;  // a console row that wraps
     for (int i = 0; i < 60; i++) row += "wrap test ";
     ov::addLine(row.c_str());
+    insp::View v{};  // the Entities window: a list, an entity with an expanded and a truncated component, two pins
+    v.inWorld = true;
+    for (uint32_t i = 1; i <= 300; i++) v.rows.push_back({i, i == 2 ? -1.0f : float(i), {}, 7, i % 2 == 0, int32_t(i), -1});
+    v.matched = 300, v.sel = 1, v.selSerial = 1, v.note = "Health.dataStorage[0]: Set to 123";
+    v.comps = {{0x1234, {}, true, false, std::vector<uint8_t>(40)}, {0x5678, {}, true, true, {}}, {0x9abc, {}, false, false, {}}};
+    v.pins = {{1, 0x1234, 8, {}, "Health.dataStorage[0]", false, true, {}}, {2, 0x1234, 8, {}, "Health.dataStorage[0]", true, false, {}}};
+    insp::testView(std::move(v));
 }
 
 // overlay_selftest only: shows or ends the first-start key window.
@@ -1449,6 +1940,7 @@ ov::Settings ov::readSettings() {
     s.fpsCap = cap <= 0 ? 0 : std::max(cap, 10);
     s.historyLimit = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"runtime", L"historyLimit", 100, path.c_str())), 1, 10000);
     s.saveHistory = GetPrivateProfileIntW(L"runtime", L"saveHistory", 1, path.c_str()) != 0;
+    s.debugLog = GetPrivateProfileIntW(L"runtime", L"debugLog", 1, path.c_str()) != 0;  // DebugLog
     s.keyName = utf8(key);
     s.key = rt::keyFromName(s.keyName.c_str());
     for (int i = 0; i < 3; i++)
@@ -1469,7 +1961,8 @@ bool ov::saveSettings(const Settings& s) {
                                       path.c_str()) &&
            WritePrivateProfileStringW(L"runtime", L"antiAliasing", s.aaOff ? L"off" : L"default", path.c_str()) &&
            WritePrivateProfileStringW(L"runtime", L"historyLimit", std::to_wstring(s.historyLimit).c_str(), path.c_str()) &&
-           WritePrivateProfileStringW(L"runtime", L"saveHistory", s.saveHistory ? L"1" : L"0", path.c_str());
+           WritePrivateProfileStringW(L"runtime", L"saveHistory", s.saveHistory ? L"1" : L"0", path.c_str()) &&
+           WritePrivateProfileStringW(L"runtime", L"debugLog", s.debugLog ? L"1" : L"0", path.c_str());  // DebugLog
 }
 
 void ov::setStatus(const std::string& key, const std::string& value, lv::Level level) {
@@ -1484,6 +1977,16 @@ void ov::setHistory(int limit, bool save) {
     gSaveHist = save;
     trimHistory();
     if (!save && !gameDir.empty()) DeleteFileW(historyPath().c_str());  // typed lines don't stay on disk
+}
+
+// Names the overlay key as the game window's layout labels it, once that window is known (not from DllMain). A key
+// that types a letter there gets a warning: ` by its code is Ö on a German keyboard, and 0.1.x accepted it.
+void nameToggleKey() {
+    int vk = gToggleKey;
+    gKeyName = keyLabel(vk);
+    if (keyChar(vk) > L' ' && IsCharAlphaW(keyChar(vk)))
+        ov::log(LV_WARN "Overlay Key: %s types a letter on this keyboard, so typing it opens the overlay: Pick another "
+                        "key in Settings", gKeyName.c_str());
 }
 
 void ov::attach(HWND wnd, const std::string& iniPath) {
@@ -1501,20 +2004,32 @@ void ov::attach(HWND wnd, const std::string& iniPath) {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                        reinterpret_cast<LPCWSTR>(&wndProc), &self);
     gOrig = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(wnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&wndProc)));
-    gHintEnd = GetTickCount64() + 5000;
+    gCrashPrompt = rep::lastSession().crashed;
+    gHintEnd = GetTickCount64() + (gCrashPrompt ? 20000 : 5000);  // the crash hint asks for more, so it stays longer
     if (!gAskOnStart) {
-        ov::log(LV_OK "Overlay: attached. %s opens and closes it.", gKeyName.c_str());
+        nameToggleKey();
+        ov::log(LV_OK "Overlay: Attached. %s opens and closes it.", gKeyName.c_str());
+        if (gCrashPrompt) {  // the Last Session window opens by itself, taking input like the first-start key window
+            gCrashOnly = gOpen = true;
+            rt::setOverlayOpen(true);
+        }
         return;
     }
     snapKeys();  // a key held right now isn't the answer
     gAskKey = gOpen = true;
     rt::setOverlayOpen(true);
-    ov::log(LV_OK "Overlay: attached. Pick its key in the window in the middle of the screen.");
+    ov::log(LV_OK "Overlay: Attached. Pick its key in the window in the middle of the screen.");
 }
 
-void ov::setToggleKey(int vk, const std::string& name) {
-    gKeyName = name;
+void ov::resize(HWND wnd, uint32_t height) {
+    if (wnd != gWnd || !height) return;
+    float s = scaleFor(static_cast<float>(height));
+    if (s != gScale) gNewScale = s;
+}
+
+void ov::setToggleKey(int vk) {
     gToggleKey = vk;
+    if (gWnd) nameToggleKey();
 }
 
 bool ov::visible() { return !gDisabled && (gOpen || hintDue() || rt::hasDraw()); }
@@ -1532,16 +2047,23 @@ void ov::disable() {
 void ov::buildFrame() {
     bool mods = rt::hasDraw() && !gAskKey;  // mods' windows would cover the key window
     if (mods && !rt::tryLockDraw()) return;
+    if (float s = gNewScale.exchange(0.0f); s > 0 && s != gScale) {  // the game changed resolution
+        gScale = s;
+        defaultStyle();
+        loadStyle();  // a saved style, rescaled from the scale it was saved at
+        ov::log("Overlay: UI scale %.2f for the new window size", s);
+    }
     if (gStyleOp == StyleLoad) gStyleMsg = loadStyle();
     if (gStyleOp == StyleDefault) {
         defaultStyle();
-        gStyleMsg = LV_WARN "default style: Save style to keep it";
+        gStyleMsg = LV_WARN "Default style: Save Style to keep it";
     }
     gStyleOp = StyleNone;
     ImGui_ImplWin32_NewFrame();
     if (!gOpen) ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
     ImGui::NewFrame();
     if (mods) rt::drawLocked();
+    insp::setOpen(gOpen && !gAskKey && !gCrashOnly && gShow[WinEnt]);  // the inspector refreshes only while it's seen
     if (gOpen) drawWindows();
     else if (hintDue()) drawHint();
     ImGui::Render();

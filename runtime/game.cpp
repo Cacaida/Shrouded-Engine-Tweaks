@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -287,6 +288,38 @@ refl::Type refl::unwrap(Type u) {
     return u;
 }
 
+bool refl::path(Type t, std::string_view p, uint32_t& off, Type& leaf) {
+    off = 0;
+    t = t.resolved();
+    while (!p.empty()) {
+        if (p[0] == '[') {
+            size_t end = p.find(']');
+            if (end == std::string_view::npos || end < 2 || t.prim() != StaticArray || !t.inner()) return false;
+            uint32_t i = 0;
+            for (char c : p.substr(1, end - 1)) {
+                if (c < '0' || c > '9' || i > 100000) return false;
+                i = i * 10 + uint32_t(c - '0');
+            }
+            Type e = t.inner();
+            if (!e.size() || i >= t.size() / e.size()) return false;
+            off += i * e.size();
+            t = e.resolved();
+            p.remove_prefix(end + 1);
+            if (!p.empty() && p[0] == '.') p.remove_prefix(1);
+            continue;
+        }
+        size_t end = p.find_first_of(".[");
+        Field f;
+        if (!field(t, p.substr(0, end), f)) return false;
+        off += f.offset;
+        t = f.type.resolved();
+        p.remove_prefix(end == std::string_view::npos ? p.size() : end);
+        if (!p.empty() && p[0] == '.') p.remove_prefix(1);
+    }
+    leaf = unwrap(t);  // a wrapper's only field sits at offset 0
+    return bool(leaf);
+}
+
 uint32_t refl::fnv(std::string_view s) {
     uint32_t h = 0x811c9dc5;
     for (unsigned char c : s) h = (h ^ c) * 0x01000193;
@@ -411,6 +444,25 @@ uintptr_t hk::findPattern(uintptr_t base, std::string_view pattern, std::string&
     }
     if (!hit) err = "pattern not found in .text";
     return hit;
+}
+
+bool hk::matchAt(uintptr_t base, uintptr_t at, std::string_view pattern, std::string& err) {
+    err.clear();
+    std::vector<int> bytes;
+    if (!parsePattern(pattern, bytes)) {
+        err = "malformed pattern: use 1..256 byte pairs or ??, with at least one exact byte";
+        return false;
+    }
+    Code code = cleanText(base);
+    auto live = reinterpret_cast<uintptr_t>(code.live);
+    if (!code.data || at < live || at - live > code.size || bytes.size() > code.size - (at - live)) {
+        err = "outside .text";
+        return false;
+    }
+    const uint8_t* p = code.data + (at - live);
+    for (size_t i = 0; i < bytes.size(); ++i)
+        if (bytes[i] >= 0 && bytes[i] != p[i]) return false;
+    return true;
 }
 
 // A system descriptor in .rdata holds its function pointer; fn + 0x88 holds {entries, count} of the resources it reads
@@ -708,12 +760,12 @@ bool opts::findLayout(uintptr_t base) {
 
 const char* opts::attach(uintptr_t o) {
     refl::Type mt = machineType(), ut = userType();
-    if (!slotSize) return "the user settings layout wasn't found";
-    if (!mt || !ut || mt.size() > slotsAt - kMachine || ut.size() != hasAt - 8) return "the settings types differ";
-    if (!o) return "no options object yet";
+    if (!slotSize) return "The user settings layout wasn't found";
+    if (!mt || !ut || mt.size() > slotsAt - kMachine || ut.size() != hasAt - 8) return "The settings types differ";
+    if (!o) return "No options object yet";
     auto m = reinterpret_cast<const uint8_t*>(o + kMachine);
     if (refl::Field f = refl::badField(mt, m); !f.name.empty()) {
-        snprintf(gWhy, sizeof gWhy, "machine field %.*s = %s", int(f.name.size()), f.name.data(),
+        snprintf(gWhy, sizeof gWhy, "Machine field %.*s = %s", int(f.name.size()), f.name.data(),
                  refl::text(m + f.offset, refl::unwrap(f.type.resolved())).c_str());
         return gWhy;
     }
@@ -816,8 +868,10 @@ struct Map {
     }
 };
 
+}  // namespace
+
 // Component idx of the entity behind record rec: chunk + offset[idx] + row * stride[idx], if its archetype has it.
-uint8_t* inRecord(uintptr_t rec, int idx) {
+uint8_t* ecs::inRecord(uintptr_t rec, int idx) {
     auto arch = rd<uintptr_t>(rec + kRecArch);
     auto i = static_cast<uintptr_t>(idx);
     if (!arch || !(rd<uint64_t>(arch + (i >> 6) * 8) >> (i & 63) & 1)) return nullptr;
@@ -825,7 +879,44 @@ uint8_t* inRecord(uintptr_t rec, int idx) {
     return reinterpret_cast<uint8_t*>(rd<uintptr_t>(rec + kRecChunk) + off + rd<uint32_t>(rec + kRecRow) * stride);
 }
 
-}  // namespace
+uintptr_t ecs::record(uintptr_t world, uint32_t entity) {
+    Map m{world + kEntityMap};
+    int64_t s = m.find(entity, true);
+    return s < 0 ? 0 : m.val<uintptr_t>(static_cast<uint64_t>(s));
+}
+
+uint64_t ecs::forSlots(uintptr_t world, uint64_t from, uint64_t to, const std::function<void(uint32_t, uintptr_t)>& fn) {
+    Map m{world + kEntityMap};
+    uint64_t c = m.cap();
+    if (!c || (c & (c - 1))) return 0;
+    for (uint64_t s = from; s < to && s < c; s++) {
+        auto rec = m.used(s) ? m.val<uintptr_t>(s) : 0;
+        if (rec) fn(m.key(s), rec);
+    }
+    return c;
+}
+
+std::vector<int> ecs::recordComps(uintptr_t rec) {
+    std::vector<int> out;
+    auto arch = rd<uintptr_t>(rec + kRecArch);
+    for (int q = 0; arch && q < kMaxComp / 64; q++) {
+        for (uint64_t bits = rd<uint64_t>(arch + q * 8); bits; bits &= bits - 1)
+            out.push_back(q * 64 + static_cast<int>(std::countr_zero(bits)));
+    }
+    return out;
+}
+
+std::vector<uint32_t> ecs::compHashes(uintptr_t world) {
+    std::vector<uint32_t> out(kMaxComp);
+    Map m{rd<uintptr_t>(world) + kCompMap};
+    uint64_t c = m.cap();
+    if (!c || (c & (c - 1))) return out;
+    for (uint64_t s = 0; s < c; s++) {
+        uint16_t idx = m.used(s) ? m.val<uint16_t>(s) : uint16_t(kMaxComp);
+        if (idx < kMaxComp) out[idx] = m.key(s);
+    }
+    return out;
+}
 
 uint32_t ecs::mix(uint32_t k) {
     k = ((k >> 16) ^ k) * 0x45d9f3bu;

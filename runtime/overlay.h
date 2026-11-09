@@ -3,6 +3,7 @@
 #pragma once
 #include <windows.h>
 
+#include <cstdint>
 #include <mutex>
 #include <string>
 
@@ -22,11 +23,18 @@ struct Settings {
     bool aaOff = false;        // antialiasing kept at None, which the game's menu doesn't offer (opts::setAaOff)
     int historyLimit = 100;    // console lines Up and Down remember, 1 to 10000
     bool saveHistory = true;   // keep them across game starts, in shrouded_engine_tweaks\console_history.txt
+    bool debugLog = true;      // extra set.log lines for bug reports (ov::debug)
 };
 
 void setup(const std::wstring& game, Sink sink);     // DllMain, game only: layer manifest and env vars for the loader
+bool layerLoaded();                                  // the Vulkan loader called the layer
+bool manifestOk();                                   // ov::setup wrote the layer's manifest
+bool elevated();                                     // above medium integrity: the loader ignores our layer path
+std::string loaderVersion();                         // the game's vulkan-1.dll, e.g. "1.4.341"
+void setDebugLog(bool on);                           // settings.ini debugLog
+void debug(const char* fmt, ...);                    // ov::log to set.log only, only with debugLog on
 void addLine(const char* line);                      // console output, from any thread
-void setToggleKey(int vk, const std::string& name);  // settings.ini, read before the game builds its swapchain
+void setToggleKey(int vk);                           // settings.ini, read before the game builds its swapchain
 void setFpsCap(int fps);                             // 0 = off; applies from the next present
 void setHistory(int limit, bool save);               // trims the console history; save off deletes its file
 // A row of the Settings window's Status (what the runtime found), from any thread, colored by its level. A warn or
@@ -42,6 +50,7 @@ std::string utf8(const std::wstring& w);
 void log(const char* fmt, ...);                      // to the runtime's sink, if setup ran
 extern std::mutex uiMx;                              // held around every ImGui call
 void attach(HWND wnd, const std::string& iniPath);   // first window only: ImGui context, Win32 backend, subclass
+void resize(HWND wnd, uint32_t height);              // every swapchain: rescales the UI if the attached window's height changed
 bool visible();                                      // open, or mods draw windows (Draw.add)
 void disable();                                      // closes the overlay for good (after a crash in drawing)
 void buildFrame();                                   // ImGui frame: own windows if open, then mods'; caller holds uiMx

@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "imgui.h"
@@ -33,6 +34,8 @@ constexpr uint64_t kTimeout = 1'000'000'000;  // 1 s for our own fences: a stuck
 ov::Sink gSink;
 std::string gIni;              // imgui.ini, UTF-8
 std::atomic<uint64_t> gDrawn;  // frames the overlay drew; read by overlay_selftest through rtOverlayFrames
+std::atomic<bool> gInstSeen;   // our CreateInstance ran: the loader put the layer into the game's chain
+bool gManifestOk;
 
 // Down-chain device functions, loaded through the next layer's vkGetDeviceProcAddr.
 #define DEV_FNS(X)                                                                                                     \
@@ -282,7 +285,10 @@ bool recordAndSubmit(Swap& s, uint32_t img, const VkPresentInfoKHR* info) {
     uint32_t slot = gGfx.slot++ % gGfx.cmds.size();
     VkFence fence = gGfx.fences[slot];
     VkCommandBuffer cb = gGfx.cmds[slot];
-    if (d->WaitForFences(d->dev, 1, &fence, VK_TRUE, kTimeout) != VK_SUCCESS) return false;
+    if (d->WaitForFences(d->dev, 1, &fence, VK_TRUE, kTimeout) != VK_SUCCESS) {
+        ov::debug("Overlay: Frame skipped, the previous overlay frame was still on the GPU after 1 s");  // Fence timeout
+        return false;
+    }
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     d->BeginCommandBuffer(cb, &bi);
@@ -299,7 +305,7 @@ bool recordAndSubmit(Swap& s, uint32_t img, const VkPresentInfoKHR* info) {
                     stages.data(), 1, &cb, 1, &s.done[img]};
     d->ResetFences(d->dev, 1, &fence);
     if (d->QueueSubmit(gGfx.queue, 1, &si, fence) != VK_SUCCESS) {
-        ov::log(LV_BAD "Overlay: queue submit failed, overlay off until the game restarts");
+        ov::log(LV_BAD "Overlay: Queue submit failed, overlay off until the game restarts");
         ov::disable();
         return false;
     }
@@ -312,10 +318,19 @@ bool draw(Dev* d, Swap& s, VkSwapchainKHR sc, VkQueue q, uint32_t family, const 
         ov::disable();
         return false;
     }
-    if (d != gGfx.dev || q != gGfx.queue) return false;
+    if (d != gGfx.dev || q != gGfx.queue) {
+        // another device or queue: the overlay won't show on these frames, said once
+        static bool once;
+        if (!std::exchange(once, true))
+            ov::log("Overlay: The game presents from another GPU queue too; the overlay draws only on its first one");
+        return false;
+    }
     if (s.format != gGfx.format) rebuildPass(s.format);
     if (s.fbs.empty() && !makeSwapRes(s, sc)) {
         freeSwapRes(s);
+        static bool once;  // Used to fail silently
+        if (!std::exchange(once, true))
+            ov::log(LV_BAD "Overlay: Making the swapchain's image views or framebuffers failed, no overlay on it");
         return false;
     }
     return recordAndSubmit(s, info->pImageIndices[0], info);
@@ -337,7 +352,7 @@ bool guardedDraw(Dev* d, Swap* s, VkSwapchainKHR sc, VkQueue q, uint32_t family,
             ov::uiMx.unlock();
         }
         ov::disable();
-        ov::log(LV_BAD "Overlay: access violation while drawing, overlay off until the game restarts");
+        ov::log(LV_BAD "Overlay: Access violation while drawing, overlay off until the game restarts");
         return false;
     }
 }
@@ -359,6 +374,7 @@ void shutdownGfx() {
 
 VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo* ci, const VkAllocationCallbacks* alloc,
                                               VkInstance* out) {
+    gInstSeen = true;
     auto* link = findLink<VkLayerInstanceCreateInfo>(ci->pNext, VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO,
                                                      VK_LAYER_LINK_INFO);
     if (!link) return VK_ERROR_INITIALIZATION_FAILED;
@@ -493,6 +509,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice dev, const VkSwapchai
     }
     std::lock_guard lock(ov::uiMx);
     ov::attach(wnd, gIni);
+    ov::resize(wnd, ci->imageExtent.height);
     return r;
 }
 
@@ -516,8 +533,8 @@ VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice dev, VkSwapchainKHR sc, 
 void logSwap(Swap& s, uint32_t family) {
     s.logged = true;
     bool gfx = family < s.dev->families.size() && (s.dev->families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT);
-    ov::log(LV_OK "Overlay: swapchain %ux%u, format %d, %u images, present queue family %d (graphics: %s)", s.extent.width,
-            s.extent.height, s.format, s.images, static_cast<int>(family), gfx ? "yes" : "no");
+    ov::log(LV_OK "Overlay: Swapchain %ux%u, format %d, %u images, present queue family %d (graphics: %s)", s.extent.width,
+            s.extent.height, s.format, s.images, static_cast<int>(family), gfx ? "Yes" : "No");
 }
 
 std::atomic<int> gFpsCap;  // settings.ini fpsCap, 0 = off
@@ -554,6 +571,12 @@ void capFrame() {
     next += period;
 }
 
+// Why a visible overlay isn't drawn on a present, logged (debugLog) only when the reason changes.
+void noteSkip(const char* why) {
+    static std::atomic<const char*> last;
+    if (last.exchange(why) != why && why) ov::debug("Overlay: Not drawn: %s", why);
+}
+
 // Overlay visible: our submit waits on the game's semaphores and present waits on ours. Otherwise a plain
 // pass-through.
 VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
@@ -573,6 +596,10 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
         if (info->swapchainCount == 1 && gSwaps.count(info->pSwapchains[0])) s = &gSwaps[info->pSwapchains[0]];
     }
     bool gfx = family < d->families.size() && (d->families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT);
+    if (ov::visible())
+        noteSkip(!s    ? (info->swapchainCount != 1 ? "The present has several swapchains" : "Unknown swapchain")
+                 : !gfx ? "The present queue can't do graphics"
+                        : nullptr);
     if (!s || !gfx || !ov::visible() || !guardedDraw(d, s, info->pSwapchains[0], queue, family, info))
         return d->QueuePresentKHR(queue, info);
     gDrawn++;
@@ -660,6 +687,39 @@ void appendEnv(const wchar_t* name, const std::wstring& value, wchar_t sep) {
     SetEnvironmentVariableW(name, v.c_str());
 }
 
+// The loader's own test: above medium integrity it ignores VK_ADD_LAYER_PATH, so the layer is never found.
+bool highIntegrity() {
+    HANDLE t;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return false;
+    uint8_t buf[SECURITY_MAX_SID_SIZE + sizeof(DWORD)];
+    DWORD n = 0;
+    bool high = false;
+    if (GetTokenInformation(t, TokenIntegrityLevel, buf, sizeof buf, &n)) {
+        PSID sid = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buf)->Label.Sid;
+        high = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1) > SECURITY_MANDATORY_MEDIUM_RID;
+    }
+    CloseHandle(t);
+    return high;
+}
+
+// The game's Vulkan loader, e.g. "1.4.341". It comes with the GPU driver, so it differs between PCs.
+std::string loaderVersion() {
+    wchar_t path[MAX_PATH];
+    HMODULE m = GetModuleHandleW(L"vulkan-1.dll");
+    if (!m || !GetModuleFileNameW(m, path, MAX_PATH)) return "not loaded";
+    DWORD n = GetFileVersionInfoSizeW(path, nullptr);
+    std::vector<char> buf(n);
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!n || !GetFileVersionInfoW(path, 0, n, buf.data()) ||
+        !VerQueryValueW(buf.data(), L"\\", reinterpret_cast<void**>(&fi), &len) || !fi)
+        return "unknown";
+    char s[32];
+    snprintf(s, sizeof s, "%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+             HIWORD(fi->dwFileVersionLS));
+    return s;
+}
+
 }  // namespace
 
 VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v) {
@@ -691,19 +751,46 @@ void ov::setup(const std::wstring& game, Sink sink) {
     CreateDirectoryW(dir.c_str(), nullptr);
     dir += L"\\layer";
     CreateDirectoryW(dir.c_str(), nullptr);
-    if (!writeManifest(dir)) return;
+    if (!(gManifestOk = writeManifest(dir))) return;
     appendEnv(L"VK_ADD_LAYER_PATH", dir, L';');
     appendEnv(L"VK_LOADER_LAYERS_ENABLE", std::wstring(kLayerName, kLayerName + strlen(kLayerName)), L',');
 }
 
+bool ov::layerLoaded() { return gInstSeen; }
+
+bool ov::manifestOk() { return gManifestOk; }
+
 void ov::setFpsCap(int fps) { gFpsCap = fps; }
 
-void ov::log(const char* fmt, ...) {
+bool ov::elevated() { return highIntegrity(); }
+
+std::string ov::loaderVersion() { return ::loaderVersion(); }
+
+namespace {
+std::atomic<bool> gDebug;  // settings.ini debugLog
+
+// logOnly: the line goes to set.log only (LV_LOG).
+void vlog(const char* fmt, va_list ap, bool logOnly = false) {
     if (!gSink) return;
-    char buf[1200];
+    char buf[1200] = LV_LOG;
+    vsnprintf(buf + logOnly, sizeof buf - 1, fmt, ap);
+    gSink(buf);
+}
+}  // namespace
+
+void ov::setDebugLog(bool on) { gDebug = on; }
+
+void ov::debug(const char* fmt, ...) {
+    if (!gDebug) return;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
+    vlog(fmt, ap, true);
     va_end(ap);
-    gSink(buf);
+}
+
+void ov::log(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vlog(fmt, ap);
+    va_end(ap);
 }

@@ -1,9 +1,12 @@
 #include "lua_api.h"
 
+#include "contracts.h"
 #include "game.h"
 #include "hooks.h"
 #include "level.h"
+#include "modsettings.h"
 #include "version.h"
+#include "writelog.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -50,14 +53,23 @@ std::atomic<uint32_t> gBuild;  // the game build (rt::setGameBuild), for GetGame
 std::mutex gLuaMx;
 bool gInDraw;
 bool gInConsole, gHookShutdown;
+// Hooks.observe and Hooks.rule handles. A rule has rule >= 0, no Lua function (sub -1, ref LUA_NOREF), and the names
+// of its params in index order.
 struct HookHandler {
     int sub, ref;
     std::string mod, name;
     std::vector<hk::Arg> args;
+    int rule = -1;
+    std::vector<std::string> params;
+    bool hasList = false;
 };
 std::map<lua_Integer, HookHandler> gHooks;
 lua_Integer gNextHook = 0;
+std::map<std::string, uint32_t> gModOrder;  // the mods' load order (loadMods): rules on one target run by it
 std::atomic<bool> gBroken;  // an access violation stopped Lua work: the state is unusable, so no Lua runs again
+// The mod whose code runs right now (call() sets it from the function it calls), "" for the console and anything else
+// outside a mod. Its writes to resources, options and systems go into the write log (wlog). Under gLuaMx.
+std::string gMod;
 
 constexpr const char* kRefMt = "rt.ref";
 constexpr const char* kTicks = "rt.ticks";
@@ -74,8 +86,23 @@ constexpr const char* kOnClose = "rt.onOverlayClose";
 constexpr const char* kOnShutdown = "rt.onShutdown";
 constexpr const char* kOnEnter = "rt.onWorldEnter";
 constexpr const char* kOnLeave = "rt.onWorldLeave";
+constexpr const char* kFnMod = "rt.fnmod";          // registered function -> the mod running when it was registered
+constexpr const char* kOnChange = "rt.onSettingsChange";  // mod -> its Settings.define onChange
 uintptr_t gReady;  // server world whose pre-tick Lua work ran this tick; afterTick only dispatches for it
-bool gNewWorld;    // a session started in another world (not a respawn): onWorldEnter at the next ready tick
+// The read point's check: gReadGen is odd while rt::tick or rt::afterTick may read gReadWorld. A system job of that
+// world that saw it odd, or saw it change while it ran, overlapped Lua (rt::jobEnd counts it).
+std::atomic<uint32_t> gReadGen;
+std::atomic<uintptr_t> gReadWorld;
+std::atomic<uint64_t> gOverlaps;
+struct ReadWindow {
+    explicit ReadWindow(uintptr_t w) {
+        gReadWorld = w;
+        ++gReadGen;
+    }
+    ~ReadWindow() { ++gReadGen; }
+};
+uint64_t gSession;  // counts sessions (the new-session test in worldReady), for the inspector
+bool gNewWorld;  // a session started in another world (not a respawn): onWorldEnter at the next ready tick
 bool gLeaving;     // onWorldLeave is running: the world is going away
 bool gSeenOpen;    // the overlay state the current Lua state last saw, for onOverlayOpen and onOverlayClose
 double gDt;        // seconds since the previous tick (or frame, outside a world), for Tick.add and onUpdate
@@ -121,6 +148,23 @@ void needGame(lua_State* L) {
 void needWorld(lua_State* L) {
     if (!gInWorld) luaL_error(L, "not in a world you host");
 }
+
+// A registration remembers the mod running when it was made, so a function built with load() still belongs to its mod.
+// ponytail: one mod per function; a function two mods register stays the first one's.
+void tagFn(lua_State* L, int idx) {
+    if (gMod.empty()) return;
+    idx = lua_absindex(L, idx);
+    lua_getfield(L, LUA_REGISTRYINDEX, kFnMod);
+    lua_pushvalue(L, idx);
+    if (lua_rawget(L, -2) == LUA_TNIL) {
+        lua_pushvalue(L, idx);
+        lua_pushstring(L, gMod.c_str());
+        lua_rawset(L, -4);
+    }
+    lua_pop(L, 2);
+}
+
+std::string modOf(lua_State* L, int idx, bool* isMod = nullptr);
 
 // Address of [off, off + size) inside r's value, or a Lua error.
 uint8_t* addr(lua_State* L, const Ref& r, uint32_t off, uint32_t size, bool write = false) {
@@ -234,20 +278,25 @@ void push(lua_State* L, const Ref& r, uint32_t off, refl::Type t) {
 }
 
 // Copies n bytes into r at off. Resources go through res::write, because the game keeps their pages read-only.
+// A mod's writes to resources and options go into the write log first; a full log refuses the write.
 void put(lua_State* L, const Ref& r, uint32_t off, const void* src, uint32_t n) {
     uint8_t* p = addr(L, r, off, n, true);
+    bool logged = !gMod.empty() && r.raw && !r.gen && !r.owned;
+    if (logged && !wlog::reserve(r.plain ? wlog::Opt : wlog::Res, r.raw, p, n, gMod))
+        luaL_error(L, "write log full: this change couldn't be made undoable");
     if (!r.raw || r.gen || r.plain) {
         memcpy(p, src, n);
-        return;
+    } else {
+        static bool told;
+        uint32_t prot = 0;
+        if (!res::write(p, src, n, prot)) luaL_error(L, "resource memory couldn't be made writable");
+        if (!(prot & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !std::exchange(told, true)) {
+            char line[96];
+            snprintf(line, sizeof line, LV_OK "Resources: The game keeps them read-only (protect 0x%x), each edit lifts that", prot);
+            gSink(line);
+        }
     }
-    static bool told;
-    uint32_t prot = 0;
-    if (!res::write(p, src, n, prot)) luaL_error(L, "resource memory couldn't be made writable");
-    if (!(prot & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !std::exchange(told, true)) {
-        char line[96];
-        snprintf(line, sizeof line, LV_OK "Resources: the game keeps them read-only (protect 0x%x), each edit lifts that", prot);
-        gSink(line);
-    }
+    if (logged) wlog::wrote(p, src, n);
 }
 
 lua_Integer enumArg(lua_State* L, int arg, refl::Type t);
@@ -665,7 +714,13 @@ const sys::System& systemArg(lua_State* L) {
 int systemsEnable(lua_State* L) {
     const sys::System& s = systemArg(L);
     luaL_checktype(L, 2, LUA_TBOOLEAN);
-    sys::setOn(s, lua_toboolean(L, 2));
+    uint8_t on = lua_toboolean(L, 2) ? 1 : 0;
+    auto p = reinterpret_cast<const uint8_t*>(&s);
+    bool logged = !gMod.empty();
+    if (logged && !wlog::reserve(wlog::Sys, &s, p, 1, gMod))
+        return luaL_error(L, "write log full: this change couldn't be made undoable");
+    sys::setOn(s, on);
+    if (logged) wlog::wrote(p, &on, 1);
     return 0;
 }
 
@@ -774,6 +829,7 @@ int typesCopy(lua_State* L) {
 // Appends fn (argument 1) to a callback list in the registry: Tick.add and Draw.add.
 void addCallback(lua_State* L, const char* reg) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
+    tagFn(L, 1);
     lua_getfield(L, LUA_REGISTRYINDEX, reg);
     lua_pushvalue(L, 1);
     lua_rawseti(L, -2, lua_Integer(lua_rawlen(L, -2)) + 1);
@@ -819,6 +875,7 @@ int keysOn(lua_State* L) {
     int vk = rt::keyFromName(luaL_checkstring(L, 1));
     luaL_argcheck(L, vk != 0, 1, "unknown key (use F1-F24, A-Z, 0-9, `, Insert, Home, End, Delete, PageUp, PageDown, Pause or 0xNN)");
     luaL_checktype(L, 2, LUA_TFUNCTION);
+    tagFn(L, 2);
     lua_getfield(L, LUA_REGISTRYINDEX, kKeys);
     lua_pushvalue(L, 2);
     lua_rawseti(L, -2, vk);
@@ -896,6 +953,7 @@ int keysBind(lua_State* L) {
     bool input = lua_toboolean(L, lua_upvalueindex(2));
     const char* label = luaL_checkstring(L, 2);
     luaL_checktype(L, 3, LUA_TFUNCTION);
+    tagFn(L, 3);
     bool okId = !id.empty() && std::all_of(id.begin(), id.end(), [](char c) {
         return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
     });
@@ -941,10 +999,14 @@ int traceback(lua_State* L) {
 // pcall with a traceback; errors go to the sink. The function and nargs arguments must be on the stack.
 bool call(lua_State* L, int nargs, int nres) {
     int base = lua_gettop(L) - nargs;
+    bool isMod = false;
+    std::string mod = lua_isfunction(L, base) ? modOf(L, base, &isMod) : "";
+    std::string prior = std::exchange(gMod, isMod ? mod : "");
     lua_pushcfunction(L, traceback);
     lua_insert(L, base);
     int rc = lua_pcall(L, nargs, nres, base);
     lua_remove(L, base);
+    gMod = prior;
     if (rc == LUA_OK) return true;
     gSink((LV_BAD + std::string(lua_tostring(L, -1))).c_str());
     lua_pop(L, 1);
@@ -1092,9 +1154,26 @@ std::string modPath(lua_State* L, const char* dir) {
     return std::string(dir) + "\\" + std::string(path);
 }
 
-// A mod's io.open and io.lines: upvalue 1 is its folder, 2 the real function, called with the checked full path.
+// True for Shrouded Engine Tweaks' own files in a mod's folder (settings.json and its .tmp): the mod's io reads them,
+// but doesn't write them. Windows drops trailing dots and spaces, so "settings.json." is the same file.
+// ponytail: an 8.3 short name (SETTIN~1.JSO) still gets through; it only matters to a mod set on breaking its own file.
+bool setOwned(std::string_view path) {
+    if (path.find_first_of("/\\") != std::string_view::npos) return false;  // in a subfolder
+    while (!path.empty() && (path.back() == '.' || path.back() == ' ')) path.remove_suffix(1);
+    std::string l = lower(path);
+    return l == "settings.json" || l == "settings.json.tmp";
+}
+
+// A mod's io.open and io.lines: upvalue 1 is its folder, 2 the real function, called with the checked full path, 3
+// true for io.open. Opening settings.json to write fails the way io.open fails: nil and a message.
 int modIo(lua_State* L) {
     std::string path = modPath(L, lua_tostring(L, lua_upvalueindex(1)));
+    const char* mode = lua_toboolean(L, lua_upvalueindex(3)) ? luaL_optstring(L, 2, "r") : "r";
+    if (strpbrk(mode, "wa+") && setOwned(lua_tostring(L, 1))) {
+        lua_pushnil(L);
+        lua_pushstring(L, "settings.json belongs to Shrouded Engine Tweaks: use Settings.define to save settings");
+        return 2;
+    }
     lua_pushstring(L, path.c_str());
     lua_replace(L, 1);
     lua_pushvalue(L, lua_upvalueindex(2));
@@ -1103,18 +1182,233 @@ int modIo(lua_State* L) {
     return lua_gettop(L);
 }
 
+constexpr const char* kSettingTypes[] = {"bool", "number", "int", "choice", "text", nullptr};  // mset::Type order
+constexpr const char* kSettingWant[] = {"a boolean", "a finite number", "an integer", "one of its values", "a string"};
+
+// A setting's value at idx, checked against f's type, into num and text (a choice gives its index). False if it has
+// the wrong type; the range is mset::assign's.
+bool settingFrom(lua_State* L, int idx, const mset::Field& f, double& num, std::string& text) {
+    int t = lua_type(L, idx);
+    if (f.type == mset::Bool) {
+        num = lua_toboolean(L, idx);
+        return t == LUA_TBOOLEAN;
+    }
+    if (f.type == mset::Number || f.type == mset::Int) {
+        int isInt = 1;
+        num = f.type == mset::Int ? static_cast<double>(lua_tointegerx(L, idx, &isInt)) : lua_tonumber(L, idx);
+        return t == LUA_TNUMBER && isInt && std::isfinite(num);
+    }
+    if (t != LUA_TSTRING) return false;
+    size_t n;
+    const char* p = lua_tolstring(L, idx, &n);
+    text.assign(p, n);
+    if (f.type == mset::Text) return true;
+    auto it = std::find(f.values.begin(), f.values.end(), text);
+    num = static_cast<double>(it - f.values.begin());
+    return it != f.values.end();
+}
+
+void pushSetting(lua_State* L, const mset::Field& f) {
+    switch (f.type) {
+    case mset::Bool: lua_pushboolean(L, f.num != 0); break;
+    case mset::Number: lua_pushnumber(L, f.num); break;
+    case mset::Int: lua_pushinteger(L, static_cast<lua_Integer>(f.num)); break;
+    case mset::Choice: lua_pushstring(L, f.values[static_cast<size_t>(f.num)].c_str()); break;
+    default: lua_pushlstring(L, f.text.data(), f.text.size());
+    }
+}
+
+// Field name of the spec table at t: a number, or def if it's missing.
+double specNum(lua_State* L, int t, const char* name, double def, const std::string& key) {
+    int type = lua_getfield(L, t, name);
+    double v = type == LUA_TNIL ? def : lua_tonumber(L, -1);
+    if (type != LUA_TNIL && (type != LUA_TNUMBER || v != v))
+        luaL_error(L, "Settings.define: '%s': %s must be a number", key.c_str(), name);
+    lua_pop(L, 1);
+    return v;
+}
+
+// The range or the values of the spec table at t, for its type.
+void settingLimits(lua_State* L, int t, mset::Field& f) {
+    if (f.type == mset::Number || f.type == mset::Int) {
+        constexpr double kExact = 9007199254740992.0;  // 2^53: integers a double holds exactly
+        f.lo = specNum(L, t, "min", f.type == mset::Int ? -kExact : -HUGE_VAL, f.key);
+        f.hi = specNum(L, t, "max", f.type == mset::Int ? kExact : HUGE_VAL, f.key);
+        if (f.type == mset::Int) f.lo = std::max(std::ceil(f.lo), -kExact), f.hi = std::min(std::floor(f.hi), kExact);
+        if (f.lo > f.hi) luaL_error(L, "Settings.define: '%s': min is above max", f.key.c_str());
+    } else if (f.type == mset::Text) {
+        double max = specNum(L, t, "max", 256, f.key);
+        if (max < 1) luaL_error(L, "Settings.define: '%s': max (the length) must be 1 or more", f.key.c_str());
+        f.maxLen = static_cast<size_t>(std::min(max, 65536.0));
+    } else if (f.type == mset::Choice) {
+        lua_getfield(L, t, "values");
+        for (lua_Integer i = 1; lua_istable(L, -1) && lua_rawgeti(L, -1, i) == LUA_TSTRING; i++, lua_pop(L, 1))
+            f.values.push_back(lua_tostring(L, -1));
+        if (f.values.empty()) luaL_error(L, "Settings.define: '%s': values must list the choices (strings)", f.key.c_str());
+        lua_pop(L, 2);
+    }
+}
+
+// One entry of Settings.define: {key =, type =, default =, label =, min =, max =, values =}. Without a default: false,
+// 0 (within the range), the first choice, "".
+mset::Field settingSpec(lua_State* L, int t) {
+    mset::Field f;
+    if (lua_getfield(L, t, "key") != LUA_TSTRING) luaL_error(L, "Settings.define: every entry needs a key (a string)");
+    f.key = lua_tostring(L, -1);
+    bool okKey = !f.key.empty() && std::all_of(f.key.begin(), f.key.end(), [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    });
+    if (!okKey) luaL_error(L, "Settings.define: key '%s': use letters, digits and _ only", f.key.c_str());
+    int type = -1;
+    if (lua_getfield(L, t, "type") == LUA_TSTRING)
+        for (int i = 0; kSettingTypes[i]; i++)
+            if (strcmp(lua_tostring(L, -1), kSettingTypes[i]) == 0) type = i;
+    if (type < 0) luaL_error(L, "Settings.define: '%s': type must be bool, number, int, choice or text", f.key.c_str());
+    f.type = static_cast<mset::Type>(type);
+    f.label = lua_getfield(L, t, "label") == LUA_TSTRING ? lua_tostring(L, -1) : f.key;
+    lua_pop(L, 3);
+    settingLimits(L, t, f);
+    double num = 0;
+    std::string text;
+    if (lua_getfield(L, t, "default") != LUA_TNIL && !settingFrom(L, -1, f, num, text))
+        luaL_error(L, "Settings.define: '%s': default must be %s", f.key.c_str(), kSettingWant[f.type]);
+    lua_pop(L, 1);
+    mset::assign(f, num, text);
+    return f;
+}
+
+// mods\<mod>\settings.json into page, read with the mods' json.decode. A file that isn't a JSON object is renamed to
+// settings.json.bad; a value of the wrong type keeps its default; keys the mod doesn't define are kept, as JSON text.
+void readSettings(lua_State* L, mset::Page& page) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, page.path.c_str(), "rb") != 0 || !f) return;
+    std::string text;
+    char buf[4096];
+    for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+    fclose(f);
+    if (text.starts_with("\xEF\xBB\xBF")) text.erase(0, 3);  // Notepad's UTF-8 BOM
+    int top = lua_gettop(L);
+    std::string why = "not a JSON object";
+    size_t at = text.find_first_not_of(" \t\r\n");
+    if (at != std::string::npos && text[at] == '{') {
+        lua_getglobal(L, "json");
+        lua_getfield(L, -1, "decode");
+        lua_pushlstring(L, text.data(), text.size());
+        if (lua_pcall(L, 1, 1, 0) != LUA_OK) why = lua_tostring(L, -1);
+        else why.clear();
+    }
+    if (!why.empty()) {
+        lua_settop(L, top);
+        MoveFileExA(page.path.c_str(), (page.path + ".bad").c_str(), MOVEFILE_REPLACE_EXISTING);
+        gSink((LV_WARN "Settings: " + page.mod + "\\settings.json couldn't be read (" + why +
+               "): Renamed to settings.json.bad, using the defaults").c_str());
+        return;
+    }
+    for (lua_pushnil(L); lua_next(L, -2); lua_pop(L, 1)) {
+        std::string key = lua_tostring(L, -2);  // an object's keys are strings
+        auto it = std::find_if(page.fields.begin(), page.fields.end(), [&](const mset::Field& x) { return x.key == key; });
+        if (it == page.fields.end()) {
+            lua_getglobal(L, "json");
+            lua_getfield(L, -1, "encode");
+            lua_pushvalue(L, -3);
+            if (lua_pcall(L, 1, 1, 0) == LUA_OK) page.unknown[key] = lua_tostring(L, -1);
+            lua_pop(L, 2);
+            continue;
+        }
+        double num = it->num;
+        std::string s;
+        if (!settingFrom(L, -1, *it, num, s) || !mset::assign(*it, num, s))
+            gSink((LV_WARN "Settings: " + page.mod + ": '" + key + "' in settings.json isn't " +
+                   kSettingWant[it->type] + ", using the default").c_str());
+    }
+    lua_settop(L, top);
+}
+
+int settingGet(lua_State* L) {
+    mset::Field f;
+    const char* key = luaL_checkstring(L, 2);
+    if (!mset::get(lua_tostring(L, lua_upvalueindex(1)), key, f)) return luaL_error(L, "Settings: no setting '%s'", key);
+    pushSetting(L, f);
+    return 1;
+}
+
+// s.key = value: checked and clamped, saved within a second. No onChange: that's for edits in the overlay.
+int settingSet(lua_State* L) {
+    std::string mod = lua_tostring(L, lua_upvalueindex(1)), key = luaL_checkstring(L, 2), text;
+    mset::Field f;
+    if (!mset::get(mod, key, f)) return luaL_error(L, "Settings: no setting '%s'", key.c_str());
+    double num = f.num;
+    if (!settingFrom(L, 3, f, num, text) || !mset::set(mod, key, num, text, false))
+        return luaL_error(L, "Settings: '%s' takes %s", key.c_str(), kSettingWant[f.type]);
+    return 0;
+}
+
+// Settings.define{entries..., onChange = fn}, one closure per mod (upvalue 1: its name): the mod's typed settings,
+// with the values saved in its settings.json, once per mod. Returns the table they're read and written through.
+int settingsDefine(lua_State* L) {
+    std::string mod = lua_tostring(L, lua_upvalueindex(1));
+    luaL_checktype(L, 1, LUA_TTABLE);
+    if (mset::has(mod)) return luaL_error(L, "Settings.define: once per mod");
+    mset::Page page{mod, gModsDir + "\\" + mod + "\\settings.json"};
+    for (lua_Integer i = 1; lua_rawgeti(L, 1, i) != LUA_TNIL; i++, lua_pop(L, 1)) {
+        if (!lua_istable(L, -1)) luaL_error(L, "Settings.define: entry %d isn't a table", static_cast<int>(i));
+        mset::Field f = settingSpec(L, lua_gettop(L));
+        for (const mset::Field& g : page.fields)
+            if (g.key == f.key) luaL_error(L, "Settings.define: '%s' is defined twice", f.key.c_str());
+        page.fields.push_back(std::move(f));
+    }
+    lua_pop(L, 1);
+    if (page.fields.empty()) return luaL_error(L, "Settings.define: no settings given");
+    if (lua_getfield(L, 1, "onChange") != LUA_TNIL) {
+        luaL_checktype(L, -1, LUA_TFUNCTION);
+        tagFn(L, -1);
+        lua_getfield(L, LUA_REGISTRYINDEX, kOnChange);
+        lua_pushvalue(L, -2);
+        lua_setfield(L, -2, mod.c_str());
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    readSettings(L, page);
+    mset::define(std::move(page));
+    lua_newtable(L);  // stays empty, so every read and write goes through the metatable
+    lua_newtable(L);
+    for (const auto& f : {luaL_Reg{"__index", settingGet}, luaL_Reg{"__newindex", settingSet}}) {
+        lua_pushstring(L, mod.c_str());
+        lua_pushcclosure(L, f.func, 1);
+        lua_setfield(L, -2, f.name);
+    }
+    lua_pushboolean(L, 0);
+    lua_setfield(L, -2, "__metatable");
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
+// onChange(key, value) for each setting edited in the overlay since the last tick, run as the mod that defined it.
+void settingsEdits(lua_State* L) {
+    auto edits = mset::takeEdits();
+    if (edits.empty()) return;
+    lua_getfield(L, LUA_REGISTRYINDEX, kOnChange);
+    for (const auto& [mod, key] : edits) {
+        mset::Field f;
+        if (lua_getfield(L, -1, mod.c_str()) != LUA_TFUNCTION || !mset::get(mod, key, f)) {
+            lua_pop(L, 1);
+            continue;
+        }
+        lua_pushstring(L, key.c_str());
+        pushSetting(L, f);
+        call(L, 2, 0);
+    }
+    lua_pop(L, 1);
+}
+
 // One declared argument position: a kind name ("u32", "entity*", "cstr"...), or "<Type>*" for a copy of a plain
 // reflected type.
 hk::Arg hookArg(lua_State* L, int idx) {
     size_t len;
     const char* p = luaL_checklstring(L, idx, &len);
     std::string name(p, len);
-    static const std::pair<const char*, hk::Kind> kinds[] = {
-        {"skip", hk::Skip}, {"bool", hk::Bool}, {"u8", hk::U8}, {"u16", hk::U16}, {"u32", hk::U32},
-        {"u64", hk::U64}, {"ptrsize", hk::U64}, {"i8", hk::I8}, {"i16", hk::I16}, {"i32", hk::I32},
-        {"i64", hk::I64}, {"f32", hk::F32}, {"f64", hk::F64}, {"entity", hk::Entity},
-        {"entity*", hk::EntityPtr}, {"cstr", hk::CStr}};
-    for (const auto& k : kinds) if (name == k.first) return {k.second, {}};
+    hk::Kind kind;
+    if (hk::kindOf(name, kind)) return {kind, {}};
     if (!name.empty() && name.back() == '*') {
         name.pop_back();
         auto type = refl::lookup(name).resolved();
@@ -1169,6 +1463,7 @@ int hookRegister(lua_State* L) {
     if (cap < 1 || cap > hk::kMaxQueue) return luaL_error(L, "hook queue must be between 1 and 4096");
     lua_getfield(L, 1, "fn");
     luaL_checktype(L, -1, LUA_TFUNCTION);
+    tagFn(L, -1);
     auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     uintptr_t fn = hk::findPattern(base, pattern, err);
     if (!fn) return luaL_error(L, "%s", err.c_str());
@@ -1189,13 +1484,13 @@ int hookRegister(lua_State* L) {
     return 1;
 }
 
-// Hooks.observe{...}: hookRegister runs in a pcall so every refusal reaches the Hooks window's diagnostics. Upvalue 2
-// of hookRegister is set when hk::subscribe already recorded the refusal, so it isn't counted twice.
-int hookObserve(lua_State* L) {
+// Hooks.observe{...} and Hooks.rule{...}: fn runs in a pcall so every refusal reaches the Hooks window's diagnostics.
+// Upvalue 2 of fn is set when the hooks layer already recorded the refusal, so it isn't counted twice.
+int registerGuarded(lua_State* L, lua_CFunction fn) {
     bool recorded = false;
     lua_pushvalue(L, lua_upvalueindex(1));
     lua_pushlightuserdata(L, &recorded);
-    lua_pushcclosure(L, hookRegister, 2);
+    lua_pushcclosure(L, fn, 2);
     lua_pushvalue(L, 1);
     if (lua_pcall(L, 1, 1, 0) == LUA_OK) return 1;
     const char* err = lua_tostring(L, -1);
@@ -1204,10 +1499,334 @@ int hookObserve(lua_State* L) {
     return lua_error(L);
 }
 
+int hookObserve(lua_State* L) { return registerGuarded(L, hookRegister); }
+
+// Up to 64 entity ids from the table at idx.
+std::vector<uint32_t> ruleIds(lua_State* L, int idx) {
+    luaL_checktype(L, idx, LUA_TTABLE);
+    std::vector<uint32_t> ids;
+    lua_Integer n = lua_Integer(lua_rawlen(L, idx));
+    if (n > rules::kMaxList) luaL_error(L, "a rule's id list holds at most 64 ids");
+    for (lua_Integer i = 1; i <= n; ++i) {
+        lua_rawgeti(L, idx, i);
+        lua_Integer v = lua_isinteger(L, -1) ? lua_tointeger(L, -1) : -1;
+        if (v < 0 || v > 0xffffffffLL) luaL_error(L, "rule ids are entity ids (whole numbers)");
+        ids.push_back(uint32_t(v));
+        lua_pop(L, 1);
+    }
+    return ids;
+}
+
+struct RuleParse {
+    hk::RuleDecl d;
+    std::vector<std::string> params;  // names, in index order
+    bool hasList = false;
+    const contracts::Entry* entry = nullptr;  // target = "<catalog name>"
+};
+
+// params = {name = number}: a "$name" value reads the param's live value (Hooks.param). Indexes follow the sorted
+// names, so the same rule after a reload has the same shape and reuses its slot.
+void ruleParams(lua_State* L, RuleParse& p) {
+    int type = lua_getfield(L, 1, "params");
+    if (type != LUA_TNIL && type != LUA_TTABLE) luaL_error(L, "rule params must be a table of names to numbers");
+    std::map<std::string, double> named;
+    if (type == LUA_TTABLE) {
+        lua_pushnil(L);
+        while (lua_next(L, -2)) {
+            if (lua_type(L, -2) != LUA_TSTRING || lua_type(L, -1) != LUA_TNUMBER)
+                luaL_error(L, "rule params must be a table of names to numbers");
+            named[lua_tostring(L, -2)] = lua_tonumber(L, -1);
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    if (named.size() > rules::kMaxParams) luaL_error(L, "a rule takes at most 8 params");
+    for (const auto& [name, v] : named) {
+        p.params.push_back(name);
+        p.d.params.push_back(v);
+    }
+}
+
+// A number, true/false, "player" (SET's player entity) or "$name" (a param).
+rules::Operand ruleOperand(lua_State* L, int idx, const RuleParse& p) {
+    rules::Operand o;
+    if (lua_type(L, idx) == LUA_TNUMBER) { o.value = lua_tonumber(L, idx); return o; }
+    if (lua_type(L, idx) == LUA_TBOOLEAN) { o.value = lua_toboolean(L, idx); return o; }
+    const char* s = lua_type(L, idx) == LUA_TSTRING ? lua_tostring(L, idx) : "";
+    if (!strcmp(s, "player")) { o.src = rules::Player; return o; }
+    for (size_t i = 0; *s == '$' && i < p.params.size(); ++i)
+        if (p.params[i] == s + 1) { o.src = rules::Param; o.param = uint8_t(i); return o; }
+    luaL_error(L, *s == '$' ? "rule param '%s' isn't in params" : "rule values are numbers, booleans, \"player\" or \"$param\"", s + 1);
+    return o;
+}
+
+// A field the catalog lists for argument a (1-based) of its entry.
+rules::Loc catalogField(lua_State* L, const contracts::Entry& e, lua_Integer a, const char* name) {
+    for (const auto& f : e.fields)
+        if (f.arg == a - 1 && !strcmp(f.name, name)) return contracts::loc(f);
+    luaL_error(L, "catalog target '%s' has no field '%s' on argument %d", e.name, name, int(a));
+    return {};
+}
+
+// {arg = n [, field = "path"]} at t: the value it names. An entity* argument without a field is the id it points at;
+// on a catalog target, a field is one the catalog lists.
+rules::Loc ruleLoc(lua_State* L, int t, const RuleParse& p) {
+    const auto& args = p.d.args;
+    lua_getfield(L, t, "arg");
+    int ok = 0;
+    lua_Integer a = lua_tointegerx(L, -1, &ok);
+    if (!ok || a < 1 || a > lua_Integer(args.size())) luaL_error(L, "rule entries need arg = a declared position (1..%d)", int(args.size()));
+    lua_getfield(L, t, "field");
+    if (p.entry && !lua_isnil(L, -1)) {
+        rules::Loc l = catalogField(L, *p.entry, a, luaL_checkstring(L, -1));
+        lua_pop(L, 2);
+        return l;
+    }
+    const hk::Arg& arg = args[size_t(a - 1)];
+    rules::Loc l;
+    std::string err;
+    bool found = lua_isnil(L, -1) && arg.kind != hk::EntityPtr
+                     ? hk::argLoc(arg, uint8_t(a - 1), l)
+                     : hk::fieldLoc(arg, uint8_t(a - 1), lua_isnil(L, -1) ? "" : luaL_checkstring(L, -1), l, err);
+    if (!found) luaL_error(L, "%s", err.empty() ? ("argument " + std::to_string(a) + " is a pointer: name a field").c_str() : err.c_str());
+    lua_pop(L, 2);
+    return l;
+}
+
+// The one key of names set in the entry at t, its value pushed; its index in names.
+int ruleKey(lua_State* L, int t, std::initializer_list<const char*> names, const char* what) {
+    int found = -1, i = 0;
+    for (const char* n : names) {
+        if (lua_getfield(L, t, n) != LUA_TNIL) {
+            if (found >= 0) luaL_error(L, "each %s entry takes exactly one operation", what);
+            found = i;
+        }
+        lua_pop(L, 1);
+        ++i;
+    }
+    if (found < 0) luaL_error(L, "a %s entry has no operation", what);
+    lua_getfield(L, t, names.begin()[found]);
+    return found;
+}
+
+// when or set: a list of entry tables. Returns the list's stack index, or 0 if it's absent.
+int ruleList(lua_State* L, const char* field) {
+    int type = lua_getfield(L, 1, field);
+    if (type == LUA_TNIL) { lua_pop(L, 1); return 0; }
+    if (type != LUA_TTABLE) luaL_error(L, "rule %s must be a list of tables", field);
+    size_t n = 0;
+    for (lua_pushnil(L); lua_next(L, -2); lua_pop(L, 1)) ++n;
+    if (n != lua_rawlen(L, -1)) luaL_error(L, "rule %s is a list: %s = {{arg = 1, ...}}", field, field);
+    return lua_gettop(L);
+}
+
+void ruleConds(lua_State* L, RuleParse& p) {
+    int list = ruleList(L, "when");
+    for (lua_Integer i = 1; list && lua_rawgeti(L, list, i) != LUA_TNIL; ++i) {
+        int e = lua_gettop(L);
+        luaL_checktype(L, e, LUA_TTABLE);
+        if (p.d.shape.conds == rules::kMaxConds) luaL_error(L, "a rule takes at most 8 conditions");
+        rules::Cond c;
+        c.at = ruleLoc(L, e, p);
+        c.cmp = rules::Cmp(ruleKey(L, e, {"eq", "ne", "lt", "le", "gt", "ge", "in"}, "when"));
+        if (c.cmp == rules::In) {
+            if (p.hasList) luaL_error(L, "a rule takes one in list");
+            p.hasList = true;
+            p.d.list = ruleIds(L, -1);
+        } else {
+            c.v = ruleOperand(L, -1, p);
+        }
+        p.d.shape.cond[p.d.shape.conds++] = c;
+        lua_settop(L, e - 1);
+    }
+    if (list) lua_settop(L, list - 1);
+}
+
+// block = value: a matching call doesn't run and returns value (true on a void function).
+void ruleBlock(lua_State* L, RuleParse& p) {
+    if (lua_getfield(L, 1, "block") != LUA_TNIL) {
+        p.d.shape.block = true;
+        p.d.shape.ret = ruleOperand(L, -1, p);
+    }
+    lua_pop(L, 1);
+}
+
+void ruleChanges(lua_State* L, RuleParse& p) {
+    int list = ruleList(L, "set");
+    for (lua_Integer i = 1; list && lua_rawgeti(L, list, i) != LUA_TNIL; ++i) {
+        int e = lua_gettop(L);
+        luaL_checktype(L, e, LUA_TTABLE);
+        if (p.d.shape.changes == rules::kMaxChanges) luaL_error(L, "a rule takes at most 8 changes");
+        rules::Change c;
+        c.at = ruleLoc(L, e, p);
+        c.op = rules::Op(ruleKey(L, e, {"set", "add", "mul", "min", "max"}, "set"));
+        c.v = ruleOperand(L, -1, p);
+        p.d.shape.change[p.d.shape.changes++] = c;
+        lua_settop(L, e - 1);
+    }
+    if (list) lua_settop(L, list - 1);
+}
+
+// after = {{<set|add|mul|min|max> = value}, ...}: changes to the return value, once the original returned.
+void ruleAfter(lua_State* L, RuleParse& p) {
+    auto& s = p.d.shape;
+    int list = ruleList(L, "after");
+    for (lua_Integer i = 1; list && lua_rawgeti(L, list, i) != LUA_TNIL; ++i) {
+        int e = lua_gettop(L);
+        luaL_checktype(L, e, LUA_TTABLE);
+        if (s.afters == rules::kMaxChanges) luaL_error(L, "a rule takes at most 8 after changes");
+        rules::Change c;
+        c.at = s.retAt;
+        c.op = rules::Op(ruleKey(L, e, {"set", "add", "mul", "min", "max"}, "after"));
+        c.v = ruleOperand(L, -1, p);
+        s.after[s.afters++] = c;
+        lua_settop(L, e - 1);
+    }
+    if (list) lua_settop(L, list - 1);
+    if (s.block && (s.changes || s.afters)) luaL_error(L, "a rule that blocks changes nothing: the original doesn't run");
+    if (!s.changes && !s.block && !s.afters)
+        luaL_error(L, "a rule needs set = {{arg = n, <set|add|mul|min|max> = value}, ...}, after = {...} or block = value");
+}
+
+// builds = {...}: the game builds the pattern and argument declarations were verified on. Required.
+bool ruleBuildListed(lua_State* L) {
+    if (lua_getfield(L, 1, "builds") != LUA_TTABLE || !lua_rawlen(L, -1))
+        luaL_error(L, "a rule on a pattern needs builds = {...}: the game builds it was verified on");
+    bool listed = false;
+    for (lua_Integer i = 1; lua_rawgeti(L, -1, i) != LUA_TNIL; ++i, lua_pop(L, 1))
+        listed |= lua_isinteger(L, -1) && lua_tointeger(L, -1) == lua_Integer(gBuild.load());
+    lua_pop(L, 2);
+    return listed;
+}
+
+// target = "<catalog name>": the catalog declares the arguments and the fields a rule may read or change.
+void ruleTarget(lua_State* L, RuleParse& p, contracts::Status& st) {
+    std::string target = hookText(L, "target", 128);
+    for (const char* k : {"pattern", "args", "builds"}) {
+        bool set = lua_getfield(L, 1, k) != LUA_TNIL;
+        lua_pop(L, 1);
+        if (set) luaL_error(L, "a rule on a catalog target takes no %s: the catalog has it", k);
+    }
+    if (!contracts::find(target, st) || !st.entry) luaL_error(L, "no catalog target '%s'", target.c_str());
+    p.entry = st.entry;
+    p.d.block = st.entry->caps & contracts::Block;
+    p.d.after = st.entry->caps & contracts::After;
+    p.d.shape.retAt = contracts::retLoc(*st.entry);
+    p.d.args = contracts::args(*st.entry);
+    for (const auto& f : st.entry->fields) (f.readOnly ? p.d.reads : p.d.fields).push_back(contracts::loc(f));
+}
+
+// The catalog entry's capabilities: changing an argument needs Args, changing a field Fields, blocking Block, changing
+// the return value After.
+void ruleCaps(lua_State* L, const RuleParse& p) {
+    if (p.d.shape.block && !(p.entry->caps & contracts::Block))
+        luaL_error(L, "catalog target '%s' doesn't let rules block it", p.entry->name);
+    if (p.d.shape.afters && !(p.entry->caps & contracts::After))
+        luaL_error(L, "catalog target '%s' doesn't let rules change its return value", p.entry->name);
+    for (int i = 0; i < p.d.shape.changes; ++i) {
+        bool field = p.d.shape.change[i].at.field;
+        if (!(p.entry->caps & (field ? contracts::Fields : contracts::Args)))
+            luaL_error(L, "catalog target '%s' doesn't let rules change %s", p.entry->name, field ? "fields" : "arguments");
+    }
+}
+
+// Where the rule goes: the catalog target's function, or the pattern's on a listed build. 0 if the rule stays off on
+// this game (a yellow line says why).
+uintptr_t ruleFn(lua_State* L, const RuleParse& p, const contracts::Status& st, const std::string& mod,
+                 const std::string& name) {
+    std::string off, err;
+    if (p.entry) {
+        ruleCaps(L, p);
+        if (st.fn) return st.fn;
+        off = "Catalog target '" + st.name + "' is off (" + st.why + ")";
+    } else if (ruleBuildListed(L)) {
+        uintptr_t fn = hk::findPattern(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)), hookText(L, "pattern", 4096), err);
+        if (!fn) luaL_error(L, "%s", err.c_str());
+        return fn;
+    } else {
+        off = "Not verified on game build " + std::to_string(gBuild.load());
+    }
+    gSink((LV_WARN + mod + ": Rule '" + name + "' off: " + off).c_str());
+    return 0;
+}
+
+int hookRuleRegister(lua_State* L) {
+    if (gInDraw || gInConsole || gHookShutdown || gClosing || gBroken)
+        return luaL_error(L, "Hooks.rule is unavailable in Draw, the console, or shutdown");
+    luaL_checktype(L, 1, LUA_TTABLE);
+    std::string mod = lua_tostring(L, lua_upvalueindex(1)), name = hookText(L, "name", 128), err, conflict;
+    if (name.find_first_of("/\\") != std::string::npos) return luaL_error(L, "hook names cannot contain slashes");
+    RuleParse p;
+    contracts::Status st;
+    p.d.key = mod + '/' + name;
+    bool catalog = lua_getfield(L, 1, "target") != LUA_TNIL;
+    lua_pop(L, 1);
+    if (catalog) ruleTarget(L, p, st);
+    else { hookText(L, "pattern", 4096); p.d.args = hookArgs(L); }
+    auto order = gModOrder.find(mod);
+    p.d.order = order == gModOrder.end() ? UINT32_MAX : order->second;
+    ruleParams(L, p);
+    ruleConds(L, p);
+    ruleBlock(L, p);
+    ruleChanges(L, p);
+    ruleAfter(L, p);
+    bool* recorded = static_cast<bool*>(lua_touserdata(L, lua_upvalueindex(2)));
+    if (!hk::validRule(p.d, err)) {
+        *recorded = true;  // validRule recorded it
+        return luaL_error(L, "%s", err.c_str());
+    }
+    uintptr_t fn = ruleFn(L, p, st, mod, name);
+    if (!fn) { lua_pushnil(L); return 1; }
+    if (gNextHook == LUA_MAXINTEGER) return luaL_error(L, "hook handle limit reached; reload mods");
+    int id = hk::addRule(fn, p.d, err, conflict);
+    if (id < 0) {
+        *recorded = true;
+        return luaL_error(L, "%s", err.c_str());
+    }
+    if (!conflict.empty())
+        gSink((LV_WARN + mod + ": Rule '" + name +
+               (p.d.shape.block ? "' and " + conflict + " both block this call; the first in mod order wins"
+                                : "' changes a value " + conflict + " changes too; both apply, in mod order")).c_str());
+    lua_Integer handle = ++gNextHook;
+    gHooks.emplace(handle, HookHandler{-1, LUA_NOREF, mod, name, p.d.args, id, p.params, p.hasList});
+    lua_pushinteger(L, handle);
+    return 1;
+}
+
+int hookRule(lua_State* L) { return registerGuarded(L, hookRuleRegister); }
+
+// The calling mod's active rule with the handle at 1.
+HookHandler& ownRule(lua_State* L) {
+    auto it = gHooks.find(luaL_checkinteger(L, 1));
+    if (it == gHooks.end() || it->second.rule < 0) luaL_error(L, "not an active rule");
+    if (it->second.mod != lua_tostring(L, lua_upvalueindex(1))) luaL_error(L, "cannot change another mod's rule");
+    return it->second;
+}
+
+// Hooks.param(id, name, value): the next calls use the new value.
+int hookParam(lua_State* L) {
+    HookHandler& h = ownRule(L);
+    const char* name = luaL_checkstring(L, 2);
+    double v = luaL_checknumber(L, 3);
+    auto at = std::find(h.params.begin(), h.params.end(), name);
+    if (at == h.params.end()) return luaL_error(L, "rule has no param '%s'", name);
+    hk::setParam(h.rule, int(at - h.params.begin()), v);
+    return 0;
+}
+
+// Hooks.list(id, {ids}): replaces the ids of the rule's in condition.
+int hookList(lua_State* L) {
+    HookHandler& h = ownRule(L);
+    if (!h.hasList) return luaL_error(L, "rule has no in condition");
+    hk::setList(h.rule, ruleIds(L, 2));
+    return 0;
+}
+
 void removeHook(lua_State* L, lua_Integer id) {
     auto it = gHooks.find(id);
     if (it == gHooks.end()) return;
-    hk::unsubscribe(it->second.sub);
+    if (it->second.rule >= 0) hk::removeRule(it->second.rule);
+    else hk::unsubscribe(it->second.sub);
     luaL_unref(L, LUA_REGISTRYINDEX, it->second.ref);
     gHooks.erase(it);
 }
@@ -1277,7 +1896,7 @@ void runHook(lua_State* L, lua_Integer id, const HookHandler& h, const hk::Batch
         // Allocating the event can run Lua finalizers that remove a subscription.
         if (!gHooks.contains(id) || !hk::delivered(h.sub, batch.generation)) { lua_settop(L, top); break; }
         if (!call(L, 1, 0)) {
-            gSink((LV_BAD + h.mod + ": hook '" + h.name + "' removed after an error").c_str());
+            gSink((LV_BAD + h.mod + ": Hook '" + h.name + "' removed after an error").c_str());
             removeHook(L, id);
         }
         lua_settop(L, top);
@@ -1290,12 +1909,12 @@ void dispatchHooks(lua_State* L) {
     hk::Batch batch;
     // Seal every batch before any handler runs, including calls caused by another handler.
     for (const auto& [id, h] : gHooks)
-        if (hk::drain(h.sub, batch)) runs.push_back({id, h, std::exchange(batch, {})});
+        if (h.rule < 0 && hk::drain(h.sub, batch)) runs.push_back({id, h, std::exchange(batch, {})});
     for (const auto& r : runs) runHook(L, r.id, r.handler, r.batch);
 }
 
 // A mod's globals: its own table, falling back to the shared one, plus what has to know the mod: Keys.hotkey and
-// Keys.input, io inside its folder, and require from its folder.
+// Keys.input, Hooks, Settings.define, io inside its folder, and require from its folder.
 void pushModEnv(lua_State* L, const std::string& name) {
     std::string dir = gModsDir + "\\" + name;
     lua_newtable(L);
@@ -1317,7 +1936,8 @@ void pushModEnv(lua_State* L, const std::string& name) {
     }
     lua_setfield(L, env, "Keys");
     lua_newtable(L);
-    for (const auto& f : {luaL_Reg{"observe", hookObserve}, luaL_Reg{"remove", hookRemove}}) {
+    for (const auto& f : {luaL_Reg{"observe", hookObserve}, luaL_Reg{"rule", hookRule}, luaL_Reg{"param", hookParam},
+                          luaL_Reg{"list", hookList}, luaL_Reg{"remove", hookRemove}}) {
         lua_pushstring(L, name.c_str());
         lua_pushcclosure(L, f.func, 1);
         lua_setfield(L, -2, f.name);
@@ -1328,11 +1948,17 @@ void pushModEnv(lua_State* L, const std::string& name) {
     for (const char* fn : {"open", "lines"}) {
         lua_pushstring(L, dir.c_str());
         lua_getfield(L, -2, fn);
-        lua_pushcclosure(L, modIo, 2);
+        lua_pushboolean(L, fn[0] == 'o');
+        lua_pushcclosure(L, modIo, 3);
         lua_setfield(L, -3, fn);
     }
     lua_pop(L, 1);
     lua_setfield(L, env, "io");
+    lua_newtable(L);
+    lua_pushstring(L, name.c_str());
+    lua_pushcclosure(L, settingsDefine, 1);
+    lua_setfield(L, -2, "define");
+    lua_setfield(L, env, "Settings");
     lua_getfield(L, LUA_REGISTRYINDEX, kRequire);
     lua_pushvalue(L, env);
     lua_pushstring(L, dir.c_str());
@@ -1340,8 +1966,6 @@ void pushModEnv(lua_State* L, const std::string& name) {
     lua_call(L, 3, 1);
     lua_setfield(L, env, "require");
 }
-
-std::string modOf(lua_State* L, int idx);
 
 // In the table at idx, every function of mod becomes false (a list, like a dropped callback) or is removed (a map).
 void dropModFns(lua_State* L, int idx, const std::string& mod, bool map) {
@@ -1378,6 +2002,8 @@ void unloadMod(lua_State* L, const std::string& mod) {
         std::erase_if(gBinds, [&](const Binding& b) { return b.mod == mod; });
     }
     removeModHooks(L, mod);
+    wlog::leave(mod, gSink);
+    mset::drop(mod, gSink);
 }
 
 // mods/<name>/mod.json, optional: {"requires": "0.1.1", "builds": [1793791052]}: the oldest Shrouded Engine Tweaks the
@@ -1424,15 +2050,15 @@ bool newerThanSet(const std::string& want) {
     return std::lexicographical_compare(b, b + 3, a, a + 3);
 }
 
-// "Mod loaded: x", or failed, with the builds a mod.json named when this game build isn't one of them.
+// "Mod Loaded: x", or failed, with the builds a mod.json named when this game build isn't one of them.
 std::string modLine(const std::string& name, bool ok, const ModInfo& info) {
     bool other = !info.builds.empty() && std::find(info.builds.begin(), info.builds.end(), gBuild) == info.builds.end();
-    std::string line = (ok ? (other ? LV_WARN "Mod loaded: " : LV_OK "Mod loaded: ") : LV_BAD "Mod failed: ") + name;
+    std::string line = (ok ? (other ? LV_WARN "Mod Loaded: " : LV_OK "Mod Loaded: ") : LV_BAD "Mod Failed: ") + name;
     if (!other) return line;
     std::string made;
     for (uint32_t b : info.builds) made += (made.empty() ? "" : ", ") + std::to_string(b);
     line += " (made for game build" + std::string(info.builds.size() > 1 ? "s " : " ") + made + ", this is " +
-            std::to_string(gBuild) + (ok ? ")" : ": wrong game version?)");
+            std::to_string(gBuild) + (ok ? ")" : ": Wrong game version?)");
     return line;
 }
 
@@ -1440,6 +2066,7 @@ std::string modLine(const std::string& name, bool ok, const ModInfo& info) {
 // What init.lua returns is kept for GetMod (true if it returns nothing).
 void loadMods(lua_State* L) {
     int loaded = 0, failed = 0;
+    gModOrder.clear();
     lua_getfield(L, LUA_REGISTRYINDEX, kMods);
     int mods = lua_gettop(L);
     WIN32_FIND_DATAA fd;
@@ -1448,13 +2075,14 @@ void loadMods(lua_State* L) {
         std::string name = fd.cFileName, init = gModsDir + "\\" + name + "\\init.lua";
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || name[0] == '.') continue;
         if (GetFileAttributesA(init.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            gSink((LV_WARN "Mod skipped: " + name + " (no init.lua)").c_str());
+            gSink((LV_WARN "Mod Skipped: " + name + " (no init.lua)").c_str());
             continue;
         }
+        gModOrder.emplace(name, uint32_t(gModOrder.size()));
         ModInfo info = readModJson(L, name);
         if (!info.needs.empty() && newerThanSet(info.needs)) {
             failed++;
-            gSink((LV_BAD "Mod skipped: " + name + " (needs Shrouded Engine Tweaks " + info.needs +
+            gSink((LV_BAD "Mod Skipped: " + name + " (needs Shrouded Engine Tweaks " + info.needs +
                    ", this is " RUNTIME_VERSION ")").c_str());
             continue;
         }
@@ -1489,13 +2117,25 @@ int getMod(lua_State* L) {
     return 1;
 }
 
-// The mod the function at idx comes from, for error lines: its chunk name up to the first / ("@hello/init.lua" is
-// hello), "console" for a typed line, "load" for a string chunk.
-std::string modOf(lua_State* L, int idx) {
+// The mod the function at idx belongs to: the one running when it was registered (tagFn), else its chunk name up to the
+// first / ("@hello/init.lua" is hello). Otherwise "console" for a typed line and "load" for a string chunk, and isMod
+// is false.
+std::string modOf(lua_State* L, int idx, bool* isMod) {
+    idx = lua_absindex(L, idx);
+    if (isMod) *isMod = true;
+    lua_getfield(L, LUA_REGISTRYINDEX, kFnMod);
+    lua_pushvalue(L, idx);
+    if (lua_rawget(L, -2) == LUA_TSTRING) {
+        std::string m = lua_tostring(L, -1);
+        lua_pop(L, 2);
+        return m;
+    }
+    lua_pop(L, 2);
     lua_Debug ar;
     lua_pushvalue(L, idx);
     lua_getinfo(L, ">S", &ar);
     std::string_view s = ar.source ? ar.source : "";
+    if (isMod) *isMod = s.starts_with('@');
     if (!s.starts_with('@') && !s.starts_with('=')) return "load";
     s.remove_prefix(1);
     return std::string(s.substr(0, s.find('/')));
@@ -1504,7 +2144,7 @@ std::string modOf(lua_State* L, int idx) {
 // Drops callback i of the list on top of the stack after an error, naming its mod: "hello: tick callback removed".
 void dropCallback(lua_State* L, lua_Integer i, const char* what) {
     lua_rawgeti(L, -1, i);
-    gSink((LV_BAD + modOf(L, -1) + ": " + what + " removed after an error").c_str());
+    gSink((LV_BAD + modOf(L, -1) + ": " + char(toupper(static_cast<unsigned char>(*what))) + (what + 1) + " removed after an error").c_str());
     lua_pop(L, 1);
     lua_pushboolean(L, 0);
     lua_rawseti(L, -2, i);
@@ -1524,7 +2164,7 @@ void warnSlow(lua_State* L, lua_Integer i, const char* what, double ms) {
     if (!fresh && now - it->second < std::chrono::seconds(10)) return;
     it->second = now;
     char line[256];
-    snprintf(line, sizeof line, LV_WARN "%s: a %s callback took %.0f ms (the game waits for it)", mod.c_str(), what, ms);
+    snprintf(line, sizeof line, LV_WARN "%s: A %s callback took %.0f ms (the game waits for it)", mod.c_str(), what, ms);
     gSink(line);
 }
 
@@ -1572,6 +2212,7 @@ refl::Type eventType(lua_State* L, int arg) {
 int observe(lua_State* L) {
     refl::Type t = eventType(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
+    tagFn(L, 2);
     lua_getfield(L, LUA_REGISTRYINDEX, kObservers);
     if (lua_rawgeti(L, -1, t.hash()) == LUA_TNIL) {  // handler list for this type
         lua_pop(L, 1);
@@ -1979,7 +2620,7 @@ void checkSent(uintptr_t world) {
         if (m.give) gaveOne(ran);
         if (ran) continue;
         memcpy(con + s.consumed, in + s.off + s.version, 4);
-        gSink((LV_BAD "Admin command " + std::string(m.cmd->input) + ": not run by the game").c_str());
+        gSink((LV_BAD "Admin Command " + std::string(m.cmd->input) + ": Not run by the game").c_str());
     }
 }
 
@@ -2016,9 +2657,9 @@ void captureSettings(void* job) {
     }
     if (!why[0]) {
         gSettings = q.ptr;
-        gSink(LV_OK "Game settings: ready");
+        gSink(LV_OK "Game Settings: Ready");
     } else if (!gSettingsWarned.exchange(true)) {
-        gSink((LV_WARN "Game settings: not recognized yet (" + std::string(why) + "), still trying").c_str());
+        gSink((LV_WARN "Game Settings: Not recognized yet (" + std::string(why) + "), still trying").c_str());
     }
 }
 
@@ -2029,7 +2670,7 @@ bool mergeSettings(AdminMsg& m, const AdminSlot& s) {
     if (!m.cmd->merge) return true;
     auto cur = reinterpret_cast<const uint8_t*>(gSettings.load());
     if (!cur || !refl::field(s.action, "gameSettings", gs)) {
-        gSink((LV_BAD "Admin command " + std::string(m.cmd->input) + ": not run, game settings unknown").c_str());
+        gSink((LV_BAD "Admin Command " + std::string(m.cmd->input) + ": Not run, game settings unknown").c_str());
         return false;
     }
     for (uint32_t i = 0; i < gs.type.size(); i++)
@@ -2154,7 +2795,9 @@ bool worldReady(uintptr_t world) {
     // often gets the same address, so the pause matters. A death and respawn pauses too, but there the session's
     // sim time goes on; a load starts it again.
     if (world != seen || now - last > 2000) {
-        gNewWorld |= world != seen || sim < lastSim;
+        bool fresh = world != seen || sim < lastSim;
+        gNewWorld |= fresh;
+        gSession += fresh;
         seen = world;
         ok = warned = false;
         resetAdmin();
@@ -2165,9 +2808,9 @@ bool worldReady(uintptr_t world) {
     refl::Type hp = refl::byName("Health");
     ok = hp && ecs::compIndex(world, hp.hash()) >= 0 && ecs::entityCount(world) > 0;
     char line[160];
-    if (ok) snprintf(line, sizeof line, LV_OK "server world %p: %u entities, sim time %.1f s", reinterpret_cast<void*>(world),
+    if (ok) snprintf(line, sizeof line, LV_OK "Server World: %p: %u Entities, Sim Time: %.1fs.", reinterpret_cast<void*>(world),
                      ecs::entityCount(world), double(sim) / 1e9);
-    else snprintf(line, sizeof line, LV_WARN "server world %p not ready or not recognized: Lua waits", reinterpret_cast<void*>(world));
+    else snprintf(line, sizeof line, LV_WARN "Server World: %p Not recognized or ready yet: Waiting", reinterpret_cast<void*>(world));
     if (ok || !std::exchange(warned, true)) gSink(line);
     return ok;
 }
@@ -2191,6 +2834,7 @@ void closeState() {
     gHookShutdown = true;
     stopHooks(gL);
     runCallbacks(gL, kOnShutdown, "onShutdown");
+    mset::dropAll(gSink);  // after onShutdown, so what a mod sets there is saved too
     lua_close(std::exchange(gL, nullptr));
     gLoaded = false;
     gHookShutdown = false;
@@ -2199,8 +2843,9 @@ void closeState() {
 // onWorldLeave, without the game: the world is going away, or already gone when its leave went unseen.
 void leaveWorld() {
     hk::discardPending();
+    rules::setPlayer(0);
     gInWorld = false;
-    gSink("Left the world");
+    gSink(LV_LOG "Left the world");
     gLeaving = true;
     runCallbacks(gL, kOnLeave, "onWorldLeave");
     gLeaving = false;
@@ -2211,7 +2856,7 @@ void enterWorld() {
     if (gInWorld) leaveWorld();
     hk::discardPending();
     gInWorld = true;
-    gSink("Entered a world");
+    gSink(LV_LOG "Entered a world");
     runCallbacks(gL, kOnEnter, "onWorldEnter");
 }
 
@@ -2275,9 +2920,66 @@ int getGameBuild(lua_State* L) {
     return 1;
 }
 
+// Features(): {id = {compatible, available, reason, label}}, a new table on every call.
+int luaFeatures(lua_State* L) {
+    auto all = rt::features();
+    lua_createtable(L, 0, static_cast<int>(all.size()));
+    for (const rt::Feature& f : all) {
+        lua_createtable(L, 0, 4);
+        lua_pushboolean(L, f.compatible);
+        lua_setfield(L, -2, "compatible");
+        lua_pushboolean(L, f.available);
+        lua_setfield(L, -2, "available");
+        lua_pushstring(L, f.reason.c_str());
+        lua_setfield(L, -2, "reason");
+        lua_pushstring(L, f.label.c_str());
+        lua_setfield(L, -2, "label");
+        lua_setfield(L, -2, f.id.c_str());
+    }
+    return 1;
+}
+
+// The features main.cpp checks, in the Compatibility window's order. An id is never renamed or dropped once shipped:
+// a removed feature stays here, incompatible, with the reason "removed in x.y". world: usable only in a world you host.
+struct FeatDef {
+    const char* id;
+    const char* label;
+    bool world;
+};
+constexpr FeatDef kFeats[] = {
+    {"resources", "Resources (Res)", false},
+    {"english_names", "English Names (Res.text)", false},
+    {"game_options", "Game Options (GameOptions)", false},
+    {"field_of_view", "Live Field of View", false},
+    {"systems", "Systems", false},
+    {"events", "Events (Observe, Events.post)", true},
+    {"admin", "Admin Commands (Admin.*)", true},
+    {"admin_give", "Admin.give", true},
+    {"admin_settings", "Game Settings (Admin.settings)", true},
+    {"overlay", "Overlay (Draw, ImGui)", false},
+};
+struct FeatState {
+    bool set = false, compatible = false, ready = false;
+    std::string reason;
+};
+std::mutex gFeatMx;
+FeatState gFeats[std::size(kFeats)];
+
+// Key names, both ways. Punctuation is named after the US layout, in words: bindings.ini values lose surrounding
+// quotes, and a name may not contain '+', which splits combos.
 constexpr std::pair<const char*, int> kNamedKeys[] = {
-    {"`", VK_OEM_3},       {"Insert", VK_INSERT}, {"Home", VK_HOME},     {"End", VK_END},
-    {"Delete", VK_DELETE}, {"PageUp", VK_PRIOR},  {"PageDown", VK_NEXT}, {"Pause", VK_PAUSE}};
+    {"`", VK_OEM_3},         {"Insert", VK_INSERT},    {"Home", VK_HOME},          {"End", VK_END},
+    {"Delete", VK_DELETE},   {"PageUp", VK_PRIOR},     {"PageDown", VK_NEXT},      {"Pause", VK_PAUSE},
+    {"Space", VK_SPACE},     {"Tab", VK_TAB},          {"Enter", VK_RETURN},       {"Backspace", VK_BACK},
+    {"CapsLock", VK_CAPITAL}, {"Left", VK_LEFT},       {"Up", VK_UP},              {"Right", VK_RIGHT},
+    {"Down", VK_DOWN},       {"PrintScreen", VK_SNAPSHOT}, {"ScrollLock", VK_SCROLL}, {"NumLock", VK_NUMLOCK},
+    {"Num0", VK_NUMPAD0},    {"Num1", VK_NUMPAD1},     {"Num2", VK_NUMPAD2},       {"Num3", VK_NUMPAD3},
+    {"Num4", VK_NUMPAD4},    {"Num5", VK_NUMPAD5},     {"Num6", VK_NUMPAD6},       {"Num7", VK_NUMPAD7},
+    {"Num8", VK_NUMPAD8},    {"Num9", VK_NUMPAD9},     {"NumMultiply", VK_MULTIPLY}, {"NumAdd", VK_ADD},
+    {"NumSubtract", VK_SUBTRACT}, {"NumDecimal", VK_DECIMAL}, {"NumDivide", VK_DIVIDE}, {"Semicolon", VK_OEM_1},
+    {"Equals", VK_OEM_PLUS}, {"Comma", VK_OEM_COMMA},  {"Minus", VK_OEM_MINUS},    {"Period", VK_OEM_PERIOD},
+    {"Slash", VK_OEM_2},     {"LeftBracket", VK_OEM_4}, {"Backslash", VK_OEM_5},   {"RightBracket", VK_OEM_6},
+    {"Quote", VK_OEM_7},     {"<>", VK_OEM_102}};
 
 }  // namespace
 
@@ -2286,9 +2988,20 @@ void rt::configure(const std::string& modsDir, Sink sink) {
     gSink = sink;
 }
 
+// kFnMod: function -> mod, with weak keys, so a dropped function can still be collected.
+void makeFnModTable(lua_State* L) {
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_pushliteral(L, "k");
+    lua_setfield(L, -2, "__mode");
+    lua_setmetatable(L, -2);
+    lua_setfield(L, LUA_REGISTRYINDEX, kFnMod);
+}
+
 lua_State* rt::open() {
     lua_State* L = luaL_newstate();
     openSafeLibs(L);
+    makeFnModTable(L);
     luaL_newmetatable(L, kRefMt);
     const luaL_Reg meta[] = {{"__index", refIndex}, {"__newindex", refNewIndex}, {"__len", refLen},
                              {"__tostring", refToString}, {nullptr, nullptr}};
@@ -2332,8 +3045,9 @@ lua_State* rt::open() {
     lua_register(L, "registerForEvent", registerForEvent);
     lua_register(L, "GetVersion", getVersion);
     lua_register(L, "GetGameBuild", getGameBuild);
+    lua_register(L, "Features", luaFeatures);
     for (const char* reg : {kTicks, kDraws, kKeys, kObservers, kMods, kBinds, kOnInit, kOnOpen, kOnClose, kOnShutdown,
-                            kOnEnter, kOnLeave}) {
+                            kOnEnter, kOnLeave, kOnChange}) {
         lua_newtable(L);
         lua_setfield(L, LUA_REGISTRYINDEX, reg);
     }
@@ -2374,13 +3088,26 @@ namespace {
 // One tick of the loaded mods: queued lines, overlay events, hook handlers, Tick callbacks, keys, admin commands,
 // reload(). world is 0 on the main thread, outside a world. dt is timed here, so it stays true when the other thread
 // takes over.
+// The host player's entity, for rules comparing with "player": the last one is kept while it still has PlayerInput, so
+// the entity map is walked only when it changes. 0 outside a world.
+void updatePlayer(uintptr_t world) {
+    static uint32_t last;
+    refl::Type pi = refl::byName("PlayerInput");
+    int idx = world && pi ? ecs::compIndex(world, pi.hash()) : -1;
+    if (idx < 0) last = 0;
+    else if (!last || !ecs::component(world, last, idx)) last = ecs::firstWith(world, idx);
+    rules::setPlayer(last);
+}
+
 void tickMods(uintptr_t world) {
     static auto last = std::chrono::steady_clock::now();
+    updatePlayer(world);
     auto now = std::chrono::steady_clock::now();
     gDt = std::chrono::duration<double>(now - std::exchange(last, now)).count();
     if (world) checkSent(world);
     for (const std::string& line : takeQueue()) rt::exec(gL, line);
     overlayEvents();
+    settingsEdits(gL);
     hk::flushLogs();
     if (!gReload) dispatchHooks(gL);
     runCallbacks(gL, kTicks, "tick");
@@ -2389,9 +3116,11 @@ void tickMods(uintptr_t world) {
     if (gReload.exchange(false)) {
         gSink("Reloading mods");
         closeState();
+        wlog::leaveAll(gSink);  // after onShutdown, so a mod's own restore comes first
         startState();
         if (gInWorld) runCallbacks(gL, kOnEnter, "onWorldEnter");  // set up as on entering, in either case
     }
+    mset::save(false, gSink);
 }
 
 // guarded's SEH half: __try can't share a function with C++ objects to destroy or a C++ try.
@@ -2414,7 +3143,10 @@ void guarded(void (*fn)(uintptr_t), uintptr_t arg, const char* what) {
         gBroken = true;
         gLoaded = gHasDraw = false;
         stopHooks(nullptr);
-        gSink(LV_BAD "Lua: access violation, mods off until the game restarts");
+        gMod.clear();
+        if (!gClosing) wlog::leaveAll(gSink);  // C++ only: no Lua runs again
+        mset::dropAll(gSink);
+        gSink(LV_BAD "Lua: Access violation, mods off until the game restarts");
     } catch (...) {
         gSink((LV_BAD "Internal error in " + std::string(what)).c_str());
     }
@@ -2424,6 +3156,7 @@ void guarded(void (*fn)(uintptr_t), uintptr_t arg, const char* what) {
 
 void rt::tick(uintptr_t world) {
     std::lock_guard lock(gLuaMx);
+    ReadWindow rw(world);
     gReady = 0;
     if (gBroken || gClosing) return;
     guarded([](uintptr_t w) {
@@ -2463,10 +3196,13 @@ void rt::gameClosing() {
     std::lock_guard lock(gLuaMx);
     gClosing = true;
     resetAdmin();
-    if (!gL || gBroken) return;
+    if (!gL || gBroken) {
+        gSink("Game Closing");  // every clean exit logs a line starting so: the next start's crash check reads it
+        return;
+    }
     guarded([](uintptr_t) {
         if (gInWorld) leaveWorld();
-        gSink("Game closing: unloading mods");
+        gSink("Game Closing: Unloading mods");
         closeState();
     }, 0, "onShutdown");
     gLeaving = false;
@@ -2474,11 +3210,26 @@ void rt::gameClosing() {
 
 void rt::afterTick(uintptr_t world) {
     std::lock_guard lock(gLuaMx);
+    ReadWindow rw(world);
     if (!gL || gBroken || !gInWorld || world != gReady) return;
     gWorld = world;
     guarded([](uintptr_t w) { dispatchEvents(gL, w); }, world, "event dispatch");
     gWorld = 0;
 }
+
+uintptr_t rt::readyWorld(uint64_t& session) {
+    session = gSession;
+    return gInWorld && !gBroken ? gReady : 0;
+}
+
+uint32_t rt::jobStart() { return gReadGen.load(); }
+
+void rt::jobEnd(uintptr_t world, uint32_t gen) {
+    if (world == gReadWorld.load(std::memory_order_relaxed) && ((gen & 1) || gReadGen.load() != gen))
+        gOverlaps.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t rt::overlaps() { return gOverlaps.load(std::memory_order_relaxed); }
 
 void rt::queue(std::string line) {
     std::lock_guard lock(gQueueMx);
@@ -2535,6 +3286,36 @@ bool rt::systemsAvailable() { return gSysOk; }
 void rt::setAdminAvailable(bool ok) { gAdminOk = ok; }
 void rt::setGiveAvailable(bool ok) { gGiveOk = ok; }
 void rt::setSystemsAvailable(bool ok) { gSysOk = ok; }
+
+void rt::setFeature(const char* id, bool compatible, std::string reason, bool ready) {
+    std::lock_guard lock(gFeatMx);
+    for (size_t i = 0; i < std::size(kFeats); i++)
+        if (strcmp(kFeats[i].id, id) == 0) gFeats[i] = {true, compatible, ready, std::move(reason)};
+}
+
+std::vector<rt::Feature> rt::features() {
+    bool tested = testedBuild(gBuild);
+    std::vector<Feature> out{{"game_build", "Game Build " + std::to_string(gBuild),
+                              tested ? "" : "Not tested with this version: Each feature checks itself", tested, tested}};
+    {
+        std::lock_guard lock(gFeatMx);
+        for (size_t i = 0; i < std::size(kFeats); i++) {
+            const FeatState& s = gFeats[i];
+            Feature f{kFeats[i].id, kFeats[i].label, s.set ? s.reason : "Not checked yet", s.compatible,
+                      s.compatible && s.ready};
+            if (f.available && kFeats[i].world && !gInWorld) f.available = false, f.reason = "Not in a world you host";
+            out.push_back(std::move(f));
+        }
+    }
+    auto checked = contracts::checked();
+    for (const contracts::Entry& e : contracts::catalog()) {
+        auto s = std::find_if(checked.begin(), checked.end(), [&](const contracts::Status& c) { return c.name == e.name; });
+        bool ok = s != checked.end() && s->fn;
+        out.push_back({e.name, std::string("Rule Target ") + e.name, ok ? "" : s != checked.end() ? s->why : "Not checked yet",
+                       ok, ok});
+    }
+    return out;
+}
 
 void rt::setSettingsSlot(int index, uint32_t count) {
     gSettingsIdx = index;
@@ -2611,7 +3392,8 @@ int rt::heldMods() {
 std::vector<rt::BindInfo> rt::bindings(int& dead) {
     std::lock_guard lock(gBindMx);
     std::vector<BindInfo> rows;
-    for (const Binding& b : gBinds) rows.push_back({b.key, b.mod, b.label, b.vk ? comboName(b.mods, b.vk) : "", b.input});
+    for (const Binding& b : gBinds)
+        rows.push_back({b.key, b.mod, b.label, b.vk ? comboName(b.mods, b.vk) : "", b.input, b.vk});
     std::stable_sort(rows.begin(), rows.end(), [](const BindInfo& a, const BindInfo& b) { return a.mod < b.mod; });
     dead = static_cast<int>(std::count_if(gSaved.begin(), gSaved.end(), [](const auto& s) { return !findBind(s.first); }));
     return rows;
@@ -2631,7 +3413,7 @@ void rt::setBinding(const std::string& key, int mods, int vk) {
         std::string path = bindsPath();
         if (!path.empty()) WritePrivateProfileStringA("bindings", key.c_str(), vk ? combo.c_str() : nullptr, path.c_str());
     }
-    gSink((LV_OK "Binding " + key + ": " + (vk ? combo : "unbound")).c_str());
+    gSink((LV_OK "Binding " + key + ": " + (vk ? combo : "Unbound")).c_str());
 }
 
 void rt::removeDeadBindings() {

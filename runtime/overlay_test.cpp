@@ -250,6 +250,16 @@ int main(int argc, char** argv) {
     presentFrames(kFrames);
     CHECK(frames() == base);  // closed, hint over: presents pass through untouched
     printf("closed frames ok\n");
+    BYTE keys[256];
+    GetKeyboardState(keys);
+    keys[VK_CONTROL] = 0x80;  // Ctrl held: Ctrl+toggle key is another binding, and passes on to the game
+    SetKeyboardState(keys);
+    PostMessageW(gWnd, WM_KEYDOWN, VK_OEM_3, 0);
+    presentFrames(10);
+    keys[VK_CONTROL] = 0;
+    SetKeyboardState(keys);
+    CHECK(frames() == base);
+    printf("modified toggle key ignored ok\n");
     PostMessageW(gWnd, WM_KEYDOWN, VK_OEM_3, 0);  // the toggle key, handled by the layer's window subclass
     presentFrames(kFrames);
     CHECK(frames() == base + kFrames);  // open: the overlay drew into every frame

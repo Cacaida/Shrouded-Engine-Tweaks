@@ -1,6 +1,7 @@
 // Output levels. A line sent to the runtime's sink may start with one marker byte: the sink strips it, colors the
 // line in the overlay and the console window (green, yellow, red) and tags set.log lines [W] or [E]. A line without
-// one is plain output (prints, dumps). Status rows take the same levels.
+// one is plain output (prints, dumps). Status rows take the same levels. LV_LOG instead marks a line for set.log only
+// (debug lines), kept out of the overlay and the console window.
 #pragma once
 
 namespace lv {
@@ -12,3 +13,4 @@ inline Level of(const char* line) { return *line >= ok && *line <= bad ? Level(*
 #define LV_OK "\x01"
 #define LV_WARN "\x02"
 #define LV_BAD "\x03"
+#define LV_LOG "\x04"

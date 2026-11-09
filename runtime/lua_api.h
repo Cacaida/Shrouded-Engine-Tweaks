@@ -18,6 +18,14 @@ void setWorld(uintptr_t world);                      // world that Ecs.* resolve
 void exec(lua_State* L, const std::string& line);    // REPL line; expression results are printed
 void tick(uintptr_t serverWorld);                    // pre-tick: onWorldEnter, lines, hook handlers, Tick, Keys, reload
 void afterTick(uintptr_t serverWorld);               // after the world tick: Observe handlers for this tick's events
+// Right after tick, on its thread: the world Lua had this tick if it is a world you host, else 0, and a count that
+// changes with every new session (a load, another world).
+uintptr_t readyWorld(uint64_t& session);
+// The read point's check, from the system runner hook on any thread: jobStart before the system, jobEnd after it.
+// overlaps() counts the systems of a world that ran while tick or afterTick had it; the world tick's design keeps it 0.
+uint32_t jobStart();
+void jobEnd(uintptr_t world, uint32_t gen);
+uint64_t overlaps();
 void frame();                                        // main thread, each frame: loads mods, runs them outside a world
 void worldLeft();                                    // the player left the world: onWorldLeave now, without the game
 void gameClosing();                                  // the game is closing: onShutdown without the game, then no mods
@@ -37,6 +45,17 @@ void setGiveAvailable(bool ok);                      // inventory_actions is hoo
 void setSystemsAvailable(bool ok);                   // the program runner is hooked; Systems.enable errors until then
 void setGameBuild(uint32_t build);                   // the running exe's build, for GetGameBuild() and mod.json
 bool systemsAvailable();                             // the Systems window, any thread
+
+// Features() and the Compatibility window: what works on this game build (compatible) and right now (available), by
+// a stable id that never changes once shipped (docs/api-reference.md lists them). main.cpp's startup checks set them;
+// game_build and the catalog targets come from the build and contracts::checked().
+struct Feature {
+    std::string id, label, reason;  // reason: why compatible or available is false, else empty
+    bool compatible, available;
+};
+// ready false: compatible, but not usable yet or any more (reason says why). Unknown ids are ignored.
+void setFeature(const char* id, bool compatible, std::string reason = {}, bool ready = true);
+std::vector<Feature> features();                     // any thread, in the window's order
 // System hooks, before the original: writes the armed commands of that system (0 admin_player, 1 inventory_actions).
 void applyAdmin(void* job, int sys = 0);
 std::string keyName(int vk);                         // the name keyFromName takes, 0xNN for keys without one
@@ -47,6 +66,8 @@ enum KeyMod { ModCtrl = 1, ModShift = 2, ModAlt = 4 };
 struct BindInfo {
     std::string key, mod, label, combo;  // key "<mod>.<id>"; combo like "Ctrl+F6", empty if unbound
     bool input;
+    int vk;  // the combo's key, 0 if unbound
+
 };
 std::vector<BindInfo> bindings(int& dead);                  // sorted by mod; dead: saved, but no loaded mod has it
 void setBinding(const std::string& key, int mods, int vk);  // vk 0 unbinds; saved at once
